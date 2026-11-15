@@ -107,7 +107,7 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,8 +148,58 @@
+@@ -76,8 +148,63 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -137,9 +137,14 @@
 +            rowHashes[row]=h;
 +            uintptr_t o=dst+(uint64_t)row*dstStride;
 +            if(!(o&15) && !(rowBytes&15)) {
-+                for(uint32_t col=0;col<rowBytes;col+=32)
-+                    __asm__ volatile("ldp q0, q1, [%0]\n\tstp q0, q1, [%1]"
-+                        ::"r"(in+col),"r"(o+col):"v0","v1","memory");
++                // The kernel is built -mgeneral-regs-only, so no NEON here: two integer
++                // register pairs per 16 bytes, which the compiler turns into ldp/stp.
++                for(uint32_t col=0;col<rowBytes;col+=16) {
++                    uint64_t a,b;
++                    __builtin_memcpy(&a,in+col,8);__builtin_memcpy(&b,in+col+8,8);
++                    volatile uint64_t *q=(volatile uint64_t *)(o+col);
++                    q[0]=a;q[1]=b;
++                }
 +            } else if(!(o&7) && !(rowBytes&7)) {
 +                volatile uint64_t *out=(volatile uint64_t *)o;
 +                for(uint32_t col=0;col<rowBytes;col+=8) {
@@ -167,7 +172,7 @@
          transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
-@@ -93,6 +215,10 @@
+@@ -93,6 +220,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -178,7 +183,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +253,29 @@
+@@ -127,14 +258,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -208,7 +213,7 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -231,6 +372,30 @@
+@@ -231,6 +377,30 @@
          }
          uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
          uint64_t stored=UINT64_MAX;
@@ -239,7 +244,7 @@
          {
              // Store only what changed since the previous frame (the scanout memory is slow device memory).
              uint64_t need=(uint64_t)width*height*4;
-@@ -239,8 +404,8 @@
+@@ -239,8 +409,8 @@
              // lock screen that disappeared with the plain copy (int-005).
              static int diffOff=-1;
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
@@ -250,7 +255,7 @@
                  stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                      bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                      source->getLength(),sourceStride,width,height,shadow,shadowValid);
-@@ -256,6 +421,27 @@
+@@ -256,6 +426,27 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -278,7 +283,7 @@
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +573,19 @@
+@@ -387,7 +578,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -299,7 +304,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +595,13 @@
+@@ -397,12 +600,13 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
