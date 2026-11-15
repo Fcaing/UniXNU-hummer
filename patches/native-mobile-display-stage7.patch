@@ -1,6 +1,6 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -6,11 +6,19 @@
+@@ -6,11 +6,17 @@
  #include <IOKit/IOLib.h>
  #include <IOKit/IOMemoryDescriptor.h>
  #include <IOKit/IOWorkLoop.h>
@@ -10,8 +10,6 @@
  #include <IOKit/pwr_mgt/IOPMpowerState.h>
  #include <libkern/c++/OSData.h>
  #include <pexpert/pexpert.h>
-+#include <machine/machine_routines.h>
-+#include <vm/pmap.h>
 +#include <kern/debug.h>
  extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 +// Slots the system calls but this backend does not implement: record and return instead of
@@ -20,7 +18,7 @@
  extern "C" IOService *native_legacy_display_allocate(void);
  extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
  extern "C" void native_legacy_registration_observed(IOService *);
-@@ -35,6 +43,16 @@
+@@ -35,6 +41,16 @@
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
  extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
  extern "C" void native_legacy_gpu_fallback_observed(int status);
@@ -37,7 +35,7 @@
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,6 +61,111 @@
+@@ -43,6 +59,120 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -51,12 +49,15 @@
 +    // splash memory than it uses; point the SSPP at the next megabyte-aligned block inside that
 +    // reservation and alternate, so a finished frame only reaches the panel at the next refresh.
 +    // The offsets are the SM8750 MDSS ones the mainline dpu1 driver uses (MDP at MDSS+0x1000).
-+    static constexpr uint64_t flMdssPhys=0x0ae00000ULL,flMdssSize=0x94000ULL;
-+    static constexpr uint64_t flSplashPhys=0xfc800000ULL,flSplashSize=0x2b00000ULL;
++    static uint64_t flMdssPhys(){return 0x0ae00000ULL;}
++    static uint64_t flMdssBytes(){return 0x94000ULL;}
++    static uint64_t flSplashPhys(){return 0xfc800000ULL;}
++    static uint64_t flSplashSize(){return 0x2b00000ULL;}
 +    static constexpr unsigned flPipeCount=10;
 +    static uint32_t flPipeBaseOf(unsigned p){static const uint32_t t[flPipeCount]={0x4000,0x6000,0x8000,0xa000,0x24000,0x26000,0x28000,0x2a000,0x2c000,0x2e000};return t[p];}
 +    static uint32_t flPipeFlushOf(unsigned p){static const uint32_t t[flPipeCount]={1u<<0,1u<<1,1u<<2,1u<<18,1u<<11,1u<<12,1u<<24,1u<<25,1u<<13,1u<<14};return t[p];}
-+    vm_offset_t flMdss=0;
++    IOMemoryMap *flMdssMap=nullptr;
++    uint8_t *flMdss=nullptr;
 +    uint64_t flPa[2]={0,0};
 +    IOMemoryMap *flMap=nullptr;
 +    uint8_t *flVa[2]={nullptr,nullptr};
@@ -66,9 +67,16 @@
 +    uint32_t flOffset[flPipeCount]={0,0,0,0,0,0,0,0,0,0};
 +    int flShown=0;
 +    bool flReady=false,flNeedStart=false;
++    static IOMemoryMap *flMapPhysical(uint64_t pa,uint64_t bytes,IOOptionBits cache){
++        IOMemoryDescriptor *descriptor=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,(IOByteCount)bytes,kIODirectionInOut);
++        if(!descriptor)return nullptr;
++        IOMemoryMap *mapping=descriptor->map(kIOMapAnywhere|cache);
++        descriptor->release();
++        return mapping;
++    }
 +    static uint32_t flRd(uint64_t a){return *(volatile uint32_t *)(uintptr_t)a;}
 +    static void flWr(uint64_t a,uint32_t v){*(volatile uint32_t *)(uintptr_t)a=v;}
-+    uint64_t flMdp() const {return (uint64_t)flMdss+0x1000;}
++    uint64_t flMdp() const {return (uint64_t)(uintptr_t)flMdss+0x1000;}
 +    uint64_t flCtlAt(unsigned n) const {return flMdp()+0x15000+0x1000ull*n;}
 +    uint64_t flIntfAt(unsigned n) const {return flMdp()+0x34000+0x1000ull*n;}
 +    uint64_t flPipeAt(unsigned p) const {return flMdp()+flPipeBaseOf(p);}
@@ -96,8 +104,10 @@
 +    void flipStart(uint64_t fb,uint8_t *fbBase,uint32_t bytes){
 +        unsigned want=0;PE_parse_boot_argn("fb_flip",&want,sizeof want);
 +        if(want<1||!fb||!fbBase||!bytes)return;
-+        flMdss=ml_io_map((vm_offset_t)flMdssPhys,(vm_size_t)flMdssSize);
-+        if(!flMdss){panic("FBLK no mdss");}
++        flMdssMap=flMapPhysical(flMdssPhys(),flMdssBytes(),kIOMapInhibitCache);
++        if(!flMdssMap)panic("FBLK no mdss");
++        flMdss=(uint8_t *)flMdssMap->getVirtualAddress();
++        if(!flMdss)panic("FBLK no mdss window");
 +        uint64_t b=(fb+(uint64_t)bytes+0xfffffULL)&~0xfffffULL;
 +        if(want==1){
 +            panic("FBLK mdss %08x fb %08x bytes %08x b %08x | ctl0 intf %08x fetch %08x | p0 addr %08x size %08x str %08x | p1 addr %08x size %08x | intf1 %08x intf2 %08x",
@@ -107,21 +117,18 @@
 +                flRd(flPipeAt(1)+0x014), flRd(flPipeAt(1)+0x000),
 +                flRd(flIntfAt(1)+0x0ac), flRd(flIntfAt(2)+0x0ac));
 +        }
-+        if(fb<flSplashPhys||(b+(uint64_t)bytes)>flSplashPhys+flSplashSize){
++        if(fb<flSplashPhys()||(b+(uint64_t)bytes)>flSplashPhys()+flSplashSize()){
 +            panic("FBLK not in splash fb %08x b %08x end %08x", (uint32_t)fb, (uint32_t)b,
 +                (uint32_t)(b+(uint64_t)bytes));
 +        }
 +        flPa[0]=fb;flPa[1]=b;flBytes=(uint64_t)bytes;
 +        flVa[0]=fbBase;flCached[0]=bootCached;
-+        IOMemoryDescriptor *desc=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)b,(IOByteCount)bytes,kIODirectionOut);
-+        if(desc){
-+            flMap=desc->map(kIOMapAnywhere|kIOMapCopybackCache);
-+            desc->release();
-+            if(flMap)flVa[1]=(uint8_t *)flMap->getVirtualAddress();
-+        }
++        flMap=flMapPhysical(b,bytes,kIOMapCopybackCache);
++        if(flMap)flVa[1]=(uint8_t *)flMap->getVirtualAddress();
 +        flCached[1]=(flVa[1]!=nullptr);
 +        if(!flVa[1]){
-+            flVa[1]=(uint8_t *)ml_io_map_wcomb((vm_offset_t)b,(vm_size_t)bytes);
++            flMap=flMapPhysical(b,bytes,kIOMapInhibitCache);
++            if(flMap)flVa[1]=(uint8_t *)flMap->getVirtualAddress();
 +            flCached[1]=false;
 +        }
 +        if(!flVa[1])panic("FBLK no second buffer %08x", (uint32_t)b);
@@ -145,11 +152,11 @@
 +        }
 +        flReady=true;
 +    }
-+    void flipStop(){if(flMap){flMap->release();flMap=nullptr;}flVa[1]=nullptr;flReady=false;}
++    void flipStop(){if(flMap){flMap->release();flMap=nullptr;}if(flMdssMap){flMdssMap->release();flMdssMap=nullptr;}flMdss=nullptr;flVa[1]=nullptr;flReady=false;}
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
-@@ -66,6 +189,55 @@
+@@ -66,6 +196,55 @@
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -205,7 +212,7 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,9 +248,11 @@
+@@ -76,9 +255,11 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -218,7 +225,7 @@
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
      }
-@@ -93,6 +267,10 @@
+@@ -93,6 +274,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -229,7 +236,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +305,29 @@
+@@ -127,14 +312,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -259,7 +266,7 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -169,7 +362,7 @@
+@@ -169,7 +369,7 @@
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
              if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
@@ -268,7 +275,7 @@
                  bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                  native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
              }
-@@ -211,7 +404,7 @@
+@@ -211,7 +411,7 @@
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
@@ -277,7 +284,7 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -241,14 +434,14 @@
+@@ -241,14 +441,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -294,7 +301,7 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,6 +449,22 @@
+@@ -256,6 +456,22 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -317,7 +324,7 @@
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +596,19 @@
+@@ -387,7 +603,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -338,7 +345,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +618,14 @@
+@@ -397,12 +625,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
