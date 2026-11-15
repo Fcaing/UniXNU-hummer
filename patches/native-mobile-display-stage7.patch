@@ -1,42 +1,6 @@
-diff --git a/NativeLegacyDisplay.cpp b/NativeLegacyDisplay.cpp
-index 09f8e4d..f18ab6e 100644
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -6,11 +6,16 @@
- #include <IOKit/IOLib.h>
- #include <IOKit/IOMemoryDescriptor.h>
- #include <IOKit/IOWorkLoop.h>
-+#include <IOKit/IOTimerEventSource.h>
-+#include <kern/clock.h>
- #include <IOKit/pwr_mgt/IOPM.h>
- #include <IOKit/pwr_mgt/IOPMpowerState.h>
- #include <libkern/c++/OSData.h>
- #include <pexpert/pexpert.h>
- extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
-+// Slots the system calls but this backend does not implement: record and return instead of
-+// stopping the boot (they all return void).
-+extern "C" void native_legacy_backend_ignore(unsigned,void *,void *);
- extern "C" IOService *native_legacy_display_allocate(void);
- extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
- extern "C" void native_legacy_registration_observed(IOService *);
-@@ -35,6 +40,16 @@ extern "C" void native_legacy_retirement_observed(IOService *);
- // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
- extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
- extern "C" void native_legacy_gpu_fallback_observed(int status);
-+// Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
-+// through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
-+// that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
-+// work-loop timer stands in for it while at least one client has vsync notifications enabled. Events: 0 armed, 1 sent, 2 idle (no client),
-+// 3 late (deadline passed, cadence restarted), 4 started, 5 refresh properties reported at that rate.
-+extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
-+// The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
-+extern "C" bool native_legacy_set_refresh_properties(void *display);
-+extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
-+extern "C" uint64_t mach_continuous_time(void);
- // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
- // either way (no compression is implemented), so the bytes are the same.
- static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,6 +58,10 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
+@@ -58,8 +58,16 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -46,133 +10,144 @@ index 09f8e4d..f18ab6e 100644
 +    bool bootCached=false;
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
++    // v-fb-3: one content hash per source row. A row whose hash still matches the previous frame is not
++    // stored to the scanout window at all, so a mostly static screen touches a few hundred KB instead of all
++    // 14 MB and the display engine is not overwritten along its own scan line for the whole blit.
++    uint64_t *rowHashes=nullptr;uint32_t rowHashRows=0;bool rowHashesValid=false;
      bool primary=false;
-@@ -66,6 +85,55 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
-     const OriginalLegacySwapRequest *gpuRequest=nullptr;
-     uint64_t gpuLength=0;
-     bool gpuBypass=false;
-+    // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
-+    // client queue at +5592 never changes while the sender walks it.
-+    IOTimerEventSource *vsyncTimer=nullptr;
-+    uint64_t vsyncInterval=0,vsyncNext=0;
-+    unsigned vsyncHz=0;
-+    bool vsyncArmed=false;
-+    bool vsyncWanted() const {
-+        const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
-+    }
-+    // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
-+    // the last client is removed.
-+    void armVsync() {
-+        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
-+        vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
-+        vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
-+    }
-+    static void vsyncFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->vsyncTick();}
-+    void vsyncTick() {
-+        vsyncArmed=false;
-+        if(!vsyncTimer)return;
-+        if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
-+        const uint64_t now=mach_absolute_time();
-+        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
-+        native_legacy_vsync_observed(1,vsyncHz);
-+        vsyncNext+=vsyncInterval;
-+        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
-+        vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
-+    }
-+    void startVsync() {
-+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-+        if(hz<24 || hz>240 || !primary || !bootMapping || vsyncTimer)return;
-+        IOWorkLoop *loop=getWorkLoop();
-+        if(!loop)return;
-+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::vsyncFired);
-+        if(!timer)return;
-+        if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
-+        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
-+        vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
-+        // A client may already have registered: arm under the gate, like the registration does.
-+        loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
-+            static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
-+        },this);
-+    }
-+    void stopVsync() {
-+        if(!vsyncTimer)return;
-+        vsyncTimer->cancelTimeout();
-+        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
-+        OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
-+    }
- public:
-     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
-     void gpuComplete(int status) {
-@@ -76,8 +144,9 @@ public:
+     bool logicalPM=false;
+     bool transferred=false;
+@@ -140,9 +148,58 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
--    void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
-+    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
++    // v-fb-3: store only the source rows whose content changed since the previous blit and report the first and
++    // last row written, so the cache clean that follows can be limited to them. Returns false when the geometry
++    // needs the plain copy. The destination base and stride are checked for the wide stores here.
++    bool copyChangedRows(uint32_t cw,uint32_t ch,uint64_t dstStride,uintptr_t dst,
++        const unsigned char *src,uint64_t srcStride,int shadowsValid,uint32_t *firstRow,
++        uint32_t *lastRow,uint64_t *storedBytes) {
++        const uint32_t rowBytes=cw*4;
++        if(!rowHashes || rowHashRows<ch || (rowBytes&3)) return false;
++        uint32_t first=ch,last=0;uint64_t stored=0;
++        for(uint32_t row=0;row<ch;++row) {
++            const unsigned char *in=src+(uint64_t)row*srcStride;
++            uint64_t h=1469598103934665603ull;
++            uint32_t i=0;
++            for(;i+32<=rowBytes;i+=32) {
++                uint64_t a,b,c,d;
++                __builtin_memcpy(&a,in+i,8);__builtin_memcpy(&b,in+i+8,8);
++                __builtin_memcpy(&c,in+i+16,8);__builtin_memcpy(&d,in+i+24,8);
++                h=(h^a)*1099511628211ull;h=(h^b)*1099511628211ull;
++                h=(h^c)*1099511628211ull;h=(h^d)*1099511628211ull;
++            }
++            for(;i+8<=rowBytes;i+=8) {uint64_t v;__builtin_memcpy(&v,in+i,8);h=(h^v)*1099511628211ull;}
++            if(shadowsValid && rowHashes[row]==h) continue;
++            rowHashes[row]=h;
++            uintptr_t o=dst+(uint64_t)row*dstStride;
++            if(!(o&15) && !(rowBytes&15)) {
++                for(uint32_t col=0;col<rowBytes;col+=32)
++                    __asm__ volatile("ldp q0, q1, [%0]\n\tstp q0, q1, [%1]"
++                        ::"r"(in+col),"r"(o+col):"v0","v1","memory");
++            } else if(!(o&7) && !(rowBytes&7)) {
++                volatile uint64_t *out=(volatile uint64_t *)o;
++                for(uint32_t col=0;col<rowBytes;col+=8) {
++                    uint64_t v;__builtin_memcpy(&v,in+col,8);out[col/8]=v;
++                }
++            } else {
++                volatile uint32_t *out=(volatile uint32_t *)o;
++                for(uint32_t col=0;col<rowBytes;col+=4) {
++                    uint32_t v;__builtin_memcpy(&v,in+col,4);out[col/4]=v;
++                }
++            }
++            stored+=rowBytes;
++            if(row<first)first=row;
++            last=row;
++        }
++        if(firstRow)*firstRow=first;
++        if(lastRow)*lastRow=last;
++        if(storedBytes)*storedBytes=stored;
++        return true;
++    }
++    void free() override {stopVsync();if(rowHashes){IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));rowHashes=nullptr;rowHashRows=0;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
      void stop(IOService *provider) override {
-+        stopVsync();
+         stopVsync();
++        if(rowHashes){IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));rowHashes=nullptr;rowHashRows=0;}
          transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
-@@ -93,6 +162,10 @@ public:
-         setter(this,&request,false);
-     }
-     bool start(IOService *provider) override {
-+        if(!startDisplay(provider))return false;
-+        startVsync();return true;
-+    }
-+    bool startDisplay(IOService *provider) {
-         if(!IOMobileFramebufferLegacy::start(provider))return false;
-         if(primary && bootMapping)announcePoweredByFirmware();
-         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +200,29 @@ public:
-     void registerService(IOOptionBits options=0) override {
-         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
-         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
-+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-+        if(primary && hz>=24 && hz<=240)native_legacy_set_refresh_properties(this);
-         IOService::registerService(options);native_legacy_registration_observed(this);
-     }
-     bool isMainDisplay() override {return primary;}
-+    bool getRefreshAttributes(uint64_t *words,bool fixed) override {
-+        if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
-+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-+        if(hz<24 || hz>240)return true;
-+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
-+        const uint64_t interval=(1ull<<32)/hz;
-+        uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
-+        words[0]=interval;words[1]=machTime;
-+        if(fixed || locked==1){words[2]=interval;words[3]=machTime;}
-+        native_legacy_vsync_observed(5,hz);
-+        return true;
-+    }
-     // A swap the client submitted while the previous one was still on its way (transferred) is not kicked by the family again: without the
-     // re-kick after each retirement it waited for the next submission (int-143: every offer came one frame late, a still screen showed the
-     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
-     bool kicking=false,rekick=false;
-     void kickSwapQueue() override {
-+        armVsync();
-         if(kicking){rekick=true;return;}
-         kicking=true;
-         do {
-@@ -256,6 +344,16 @@ public:
+@@ -315,6 +372,30 @@
+         }
+         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+         uint64_t stored=UINT64_MAX;
++        // v-fb-3: hash each source row and store only the rows that changed (default on; sheng-fb-rows=0
++        // restores the plain full-frame blit). The cache clean below is limited to the rows written here.
++        uint32_t dirtyFirst=height,dirtyLast=0;bool dirtyKnown=false;
++        {
++            static int rowsOff=-1;
++            if(rowsOff<0) {unsigned v=1;PE_parse_boot_argn("sheng-fb-rows",&v,sizeof v);rowsOff=(v==0);}
++            uint64_t rowsNeed=(uint64_t)width*height*4;
++            if(!rowsOff && rowsNeed<=(64ull<<20)) {
++                if(!rowHashes || rowHashRows<height) {
++                    if(rowHashes && rowHashRows) IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));
++                    rowHashes=nullptr;rowHashRows=0;rowHashesValid=false;
++                    rowHashes=(uint64_t *)IOMallocAligned((vm_size_t)((uint64_t)height*8),64);
++                    if(rowHashes) rowHashRows=height;
++                }
++                uint32_t f=height,l=0;uint64_t bytes=0;
++                if(rowHashes && copyChangedRows(width,height,video.v_rowBytes,
++                    reinterpret_cast<uintptr_t>(bootMapping->getVirtualAddress()),
++                    reinterpret_cast<const unsigned char *>(source->getVirtualAddress()),sourceStride,
++                    rowHashesValid,&f,&l,&bytes)) {
++                    rowHashesValid=true;stored=bytes;
++                    if(bytes) {dirtyFirst=f;dirtyLast=l;dirtyKnown=true;}
++                }
++            }
++        }
+         {
+             // Store only what changed since the previous frame (the scanout memory is slow device memory).
+             uint64_t need=(uint64_t)width*height*4;
+@@ -323,8 +404,8 @@
+             // lock screen that disappeared with the plain copy (int-005).
+             static int diffOff=-1;
+             if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
+-            if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
+-            if(!diffOff && shadow && shadowBytes>=need)
++            if(stored==UINT64_MAX && !diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
++            if(stored==UINT64_MAX && !diffOff && shadow && shadowBytes>=need)
+                 stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                     bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                     source->getLength(),sourceStride,width,height,shadow,shadowValid);
+@@ -340,6 +421,27 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
 +        if(bootCached && bootMapping) {
-+            // Clean-and-invalidate every line the blit wrote back to the point of
-+            // coherency: the scanout engine reads DRAM, not our caches. 64-byte lines
-+            // are what the arm64 cores Apple and Qualcomm ship here use.
-+            uintptr_t cleanStart=(uintptr_t)bootMapping->getVirtualAddress() & ~(uintptr_t)63;
-+            uintptr_t cleanEnd=(uintptr_t)bootMapping->getVirtualAddress()+bootMapping->getLength();
-+            for(uintptr_t line=cleanStart;line<cleanEnd;line+=64)
-+                __asm__ volatile("dc civac, %0"::"r"(line):"memory");
-+            __asm__ volatile("dsb sy" ::: "memory");
++            // Clean-and-invalidate what the blit wrote back to the point of coherency: the scanout engine
++            // reads DRAM, not our caches. 64-byte lines are what the arm64 cores Apple and Qualcomm ship here
++            // use. v-fb-3 limits the clean to the rows the row-hash path actually stored.
++            uintptr_t cleanStart=0,cleanEnd=0;bool doClean=true;
++            if(dirtyKnown) {
++                uintptr_t base=(uintptr_t)bootMapping->getVirtualAddress();
++                cleanStart=(base+(uintptr_t)dirtyFirst*video.v_rowBytes)&~(uintptr_t)63;
++                cleanEnd=base+((uintptr_t)dirtyLast+1)*video.v_rowBytes;
++            } else if(stored==0 && rowHashesValid) {
++                doClean=false;
++            } else {
++                cleanStart=(uintptr_t)bootMapping->getVirtualAddress() & ~(uintptr_t)63;
++                cleanEnd=(uintptr_t)bootMapping->getVirtualAddress()+bootMapping->getLength();
++            }
++            if(doClean) {
++                for(uintptr_t line=cleanStart;line<cleanEnd;line+=64)
++                    __asm__ volatile("dc civac, %0"::"r"(line):"memory");
++                __asm__ volatile("dsb sy" ::: "memory");
++            }
 +        }
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +485,19 @@ public:
+@@ -471,7 +573,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -193,7 +168,7 @@ index 09f8e4d..f18ab6e 100644
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +507,13 @@ public:
+@@ -481,6 +595,7 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
@@ -201,10 +176,3 @@ index 09f8e4d..f18ab6e 100644
                  valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
              }
          }
-         OSSafeReleaseNULL(mapping);return valid;
-     }
--#define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
-+#define LEAF(n) __attribute__((noinline)) void opaque##n() override { native_legacy_backend_ignore(n,this,__builtin_return_address(0)); }
-     LEAF(211)
-     LEAF(245)
-     LEAF(246)
