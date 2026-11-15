@@ -1,5 +1,5 @@
 diff --git a/NativeLegacyDisplay.cpp b/NativeLegacyDisplay.cpp
-index 09f8e4d..95f891d 100644
+index 09f8e4d..f18ab6e 100644
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
 @@ -6,11 +6,16 @@
@@ -36,7 +36,18 @@ index 09f8e4d..95f891d 100644
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -66,6 +81,55 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
+@@ -43,6 +58,10 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
+ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
+     OSDeclareDefaultStructors(NativeLegacyDisplay)
+     IOMemoryMap *bootMapping=nullptr;
++    // v-fb-2: set when the scanout window was mapped cacheable (sheng-fb-cache=1), so
++    // every completed blit has to clean the written lines to the point of coherency
++    // before the display engine scans them out of DRAM.
++    bool bootCached=false;
+     uint32_t scanBudget=32;
+     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
+     bool primary=false;
+@@ -66,6 +85,55 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -92,7 +103,7 @@ index 09f8e4d..95f891d 100644
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,8 +140,9 @@ public:
+@@ -76,8 +144,9 @@ public:
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -103,7 +114,7 @@ index 09f8e4d..95f891d 100644
          transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
-@@ -93,6 +158,10 @@ public:
+@@ -93,6 +162,10 @@ public:
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -114,7 +125,7 @@ index 09f8e4d..95f891d 100644
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +196,29 @@ public:
+@@ -127,14 +200,29 @@ public:
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -144,7 +155,51 @@ index 09f8e4d..95f891d 100644
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -402,7 +486,7 @@ public:
+@@ -256,6 +344,16 @@ public:
+             stored=length;
+         }
+         __asm__ volatile("dsb sy" ::: "memory");
++        if(bootCached && bootMapping) {
++            // Clean-and-invalidate every line the blit wrote back to the point of
++            // coherency: the scanout engine reads DRAM, not our caches. 64-byte lines
++            // are what the arm64 cores Apple and Qualcomm ship here use.
++            uintptr_t cleanStart=(uintptr_t)bootMapping->getVirtualAddress() & ~(uintptr_t)63;
++            uintptr_t cleanEnd=(uintptr_t)bootMapping->getVirtualAddress()+bootMapping->getLength();
++            for(uintptr_t line=cleanStart;line<cleanEnd;line+=64)
++                __asm__ volatile("dc civac, %0"::"r"(line):"memory");
++            __asm__ volatile("dsb sy" ::: "memory");
++        }
+         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
+         OSSafeReleaseNULL(source);transferred=true;
+         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
+@@ -387,7 +485,19 @@ public:
+            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
+            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
+            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
+-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
++        // v-fb-2: writing 14 MB into uncached device memory runs at 50-100 MB/s, which is
++        // the whole reason every swap took 143-285 ms. Map the same window copyback-cached
++        // instead (sheng-fb-cache=1) and clean the touched lines after each blit: the CPU
++        // then stores at DRAM bandwidth and the display engine still sees DRAM contents.
++        unsigned cacheWanted=0;
++        PE_parse_boot_argn("sheng-fb-cache",&cacheWanted,sizeof(cacheWanted));
++        IOMemoryMap *mapping=nullptr;
++        bool cached=false;
++        if(cacheWanted==1) {
++            mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapCopybackCache);
++            if(mapping)cached=true;
++        }
++        if(!mapping)mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+         if(!mapping)return false;
+         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
+                    mapping->getLength()==video.v_rowBytes*video.v_height;
+@@ -397,12 +507,13 @@ public:
+             valid=width==video.v_width && height==video.v_height;
+             if(valid) {
+                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
++                bootCached=cached;
+                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+             }
          }
          OSSafeReleaseNULL(mapping);return valid;
      }
