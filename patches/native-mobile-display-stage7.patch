@@ -228,7 +228,7 @@
 +                }
 +                uint32_t f=height,l=0;uint64_t bytes=0;
 +                if(rowHashes && copyChangedRows(width,height,video.v_rowBytes,
-+                    reinterpret_cast<uintptr_t>(bootMapping->getVirtualAddress()),
++                    (uintptr_t)(uint64_t)bootMapping->getVirtualAddress(),
 +                    reinterpret_cast<const unsigned char *>(source->getVirtualAddress()),sourceStride,
 +                    rowHashesValid,&f,&l,&bytes)) {
 +                    rowHashesValid=true;stored=bytes;
