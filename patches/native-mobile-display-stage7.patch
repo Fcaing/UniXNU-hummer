@@ -35,7 +35,7 @@
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,6 +59,120 @@
+@@ -43,6 +59,157 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -67,6 +67,39 @@
 +    uint32_t flOffset[flPipeCount]={0,0,0,0,0,0,0,0,0,0};
 +    int flShown=0;
 +    bool flReady=false,flNeedStart=false;
++    IOMemoryMap *flGccMap=nullptr,*flDispccMap=nullptr;
++    uint8_t *flGcc=nullptr,*flDispcc=nullptr;
++    static bool flBranchOn(uint8_t *cbcr,uint32_t *before,uint32_t *after){
++        uint32_t was=*(volatile uint32_t *)(uintptr_t)cbcr;
++        *before=was;
++        if(!(was&1))*(volatile uint32_t *)(uintptr_t)cbcr=was|1;
++        __asm__ volatile("dsb sy":::"memory");
++        for(int i=0;i<200;i++){if(!(*(volatile uint32_t *)(uintptr_t)cbcr>>31))break;delay(5);}
++        uint32_t now=*(volatile uint32_t *)(uintptr_t)cbcr;
++        *after=now;
++        return !(now>>31)||(now&2);
++    }
++    // The display controller's register clocks, as dispcc-sm8750.c and gcc-sm8750.c name them. With
++    // them off a read of the controller never completes and the board resets, so this runs first.
++    bool flipClocks(uint32_t *gccBefore,uint32_t *gccAfter,uint32_t *gdsc,uint32_t *brBefore,uint32_t *brAfter){
++        *gccBefore=*gccAfter=*gdsc=*brBefore=*brAfter=0;
++        flGccMap=flMapPhysical(0x127000ULL,0x1000,kIOMapInhibitCache);
++        if(!flGccMap)return false;
++        flGcc=(uint8_t *)flGccMap->getVirtualAddress();
++        if(!flGcc)return false;
++        if(!flBranchOn(flGcc+0x004,gccBefore,gccAfter))return false;
++        flDispccMap=flMapPhysical(0x0af00000ULL,0x10000,kIOMapInhibitCache);
++        if(!flDispccMap)return false;
++        flDispcc=(uint8_t *)flDispccMap->getVirtualAddress();
++        if(!flDispcc)return false;
++        *gdsc=*(volatile uint32_t *)(uintptr_t)(flDispcc+0x9000);
++        if(!(*gdsc>>31))return false;
++        static const uint32_t needed[2]={0x80b0,0x8010};
++        for(unsigned i=0;i<2;i++)if(!flBranchOn(flDispcc+needed[i],brBefore,brAfter))return false;
++        static const uint32_t optional[3]={0xc004,0xa028,0x8030};
++        for(unsigned i=0;i<3;i++){uint32_t a=0,b=0;flBranchOn(flDispcc+optional[i],&a,&b);}
++        return true;
++    }
 +    static IOMemoryMap *flMapPhysical(uint64_t pa,uint64_t bytes,IOOptionBits cache){
 +        IOMemoryDescriptor *descriptor=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,(IOByteCount)bytes,kIODirectionInOut);
 +        if(!descriptor)return nullptr;
@@ -104,18 +137,22 @@
 +    void flipStart(uint64_t fb,uint8_t *fbBase,uint32_t bytes){
 +        unsigned want=0;PE_parse_boot_argn("fb_flip",&want,sizeof want);
 +        if(want<1||!fb||!fbBase||!bytes)return;
++        uint32_t gccB=0,gccA=0,gdsc=0,brB=0,brA=0;
++        bool clocks=flipClocks(&gccB,&gccA,&gdsc,&brB,&brA);
 +        flMdssMap=flMapPhysical(flMdssPhys(),flMdssBytes(),kIOMapInhibitCache);
-+        if(!flMdssMap)panic("FBLK no mdss");
-+        flMdss=(uint8_t *)flMdssMap->getVirtualAddress();
-+        if(!flMdss)panic("FBLK no mdss window");
++        flMdss=flMdssMap?(uint8_t *)flMdssMap->getVirtualAddress():nullptr;
 +        uint64_t b=(fb+(uint64_t)bytes+0xfffffULL)&~0xfffffULL;
++        if(!clocks)panic("FBLK clocks gcc %08x/%08x gdsc %08x br %08x/%08x fd %u",
++            gccB,gccA,gdsc,brB,brA,(uint32_t)fb);
++        if(!flMdss)panic("FBLK no mdss window");
 +        if(want==1){
-+            panic("FBLK mdss %08x fb %08x bytes %08x b %08x | ctl0 intf %08x fetch %08x | p0 addr %08x size %08x str %08x | p1 addr %08x size %08x | intf1 %08x intf2 %08x",
-+                flRd(flMdp()), (uint32_t)fb, bytes, (uint32_t)b,
++            panic("FBLK clk %08x gdsc %08x fb %08x bytes %08x b %08x mdss %08x mdp %08x | ctl0 i %08x f %08x | p0 %08x %08x %08x | p1 %08x %08x | intf1 %08x",
++                gccA, gdsc, (uint32_t)fb, bytes, (uint32_t)b,
++                flRd(flMdp()-0x1000), flRd(flMdp()),
 +                flRd(flCtlAt(0)+0x0f4), flRd(flCtlAt(0)+0x0fc),
 +                flRd(flPipeAt(0)+0x014), flRd(flPipeAt(0)+0x000), flRd(flPipeAt(0)+0x024),
 +                flRd(flPipeAt(1)+0x014), flRd(flPipeAt(1)+0x000),
-+                flRd(flIntfAt(1)+0x0ac), flRd(flIntfAt(2)+0x0ac));
++                flRd(flIntfAt(1)+0x0ac));
 +        }
 +        if(fb<flSplashPhys()||(b+(uint64_t)bytes)>flSplashPhys()+flSplashSize()){
 +            panic("FBLK not in splash fb %08x b %08x end %08x", (uint32_t)fb, (uint32_t)b,
@@ -152,11 +189,11 @@
 +        }
 +        flReady=true;
 +    }
-+    void flipStop(){if(flMap){flMap->release();flMap=nullptr;}if(flMdssMap){flMdssMap->release();flMdssMap=nullptr;}flMdss=nullptr;flVa[1]=nullptr;flReady=false;}
++    void flipStop(){if(flMap){flMap->release();flMap=nullptr;}if(flMdssMap){flMdssMap->release();flMdssMap=nullptr;}if(flGccMap){flGccMap->release();flGccMap=nullptr;}if(flDispccMap){flDispccMap->release();flDispccMap=nullptr;}flMdss=nullptr;flGcc=nullptr;flDispcc=nullptr;flVa[1]=nullptr;flReady=false;}
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
-@@ -66,6 +196,55 @@
+@@ -66,6 +233,55 @@
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -212,7 +249,7 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,9 +255,11 @@
+@@ -76,9 +292,11 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -225,7 +262,7 @@
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
      }
-@@ -93,6 +274,10 @@
+@@ -93,6 +311,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -236,7 +273,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +312,29 @@
+@@ -127,14 +349,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -266,7 +303,7 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -169,7 +369,7 @@
+@@ -169,7 +406,7 @@
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
              if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
@@ -275,7 +312,7 @@
                  bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                  native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
              }
-@@ -211,7 +411,7 @@
+@@ -211,7 +448,7 @@
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
@@ -284,7 +321,7 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -241,14 +441,14 @@
+@@ -241,14 +478,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -301,7 +338,7 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,6 +456,22 @@
+@@ -256,6 +493,22 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -324,7 +361,7 @@
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +603,19 @@
+@@ -387,7 +640,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -345,7 +382,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +625,14 @@
+@@ -397,12 +662,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
