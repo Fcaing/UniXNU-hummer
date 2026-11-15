@@ -44,6 +44,12 @@
 
 #pragma GCC visibility push(hidden)
 
+// Weak on purpose: when the board also links the real VerifiedRoot bundle (the
+// macOS CI builds libVerifiedRootProbe.a) or another storage archive, the strong
+// definitions must win instead of colliding here. On a display-only Linux build
+// these are the only definitions, so the refusal behaviour below still applies.
+#define HUMMER_STUB_WEAK __attribute__((weak))
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -78,17 +84,17 @@ struct hummer_vr_crypto_stub {
 struct hummer_vr_view_stub;
 
 extern const uint64_t verified_root_policy_count;
-const uint64_t verified_root_policy_count = 0;
+HUMMER_STUB_WEAK const uint64_t verified_root_policy_count = 0;
 extern const unsigned char verified_root_policies[4096];
-const unsigned char verified_root_policies[4096] = {0};
+HUMMER_STUB_WEAK const unsigned char verified_root_policies[4096] = {0};
 extern const unsigned char verified_root_key[395];
-const unsigned char verified_root_key[395] = {0};
+HUMMER_STUB_WEAK const unsigned char verified_root_key[395] = {0};
 extern const struct hummer_vr_crypto_stub vr_xnu_crypto;
-const struct hummer_vr_crypto_stub vr_xnu_crypto = {0, 0};
+HUMMER_STUB_WEAK const struct hummer_vr_crypto_stub vr_xnu_crypto = {0, 0};
 
 extern int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
 		   const struct hummer_vr_crypto_stub *, struct hummer_vr_view_stub *);
-int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
+HUMMER_STUB_WEAK int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
 	    const struct hummer_vr_crypto_stub *, struct hummer_vr_view_stub *)
 {
 	kprintf("HUMMER STUB: vr_open reached; the owner root is not built into this probe image\n");
@@ -97,7 +103,7 @@ int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
 
 extern int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, size_t,
 			   const struct hummer_vr_crypto_stub *);
-int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, size_t,
+HUMMER_STUB_WEAK int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, size_t,
 		    const struct hummer_vr_crypto_stub *)
 {
 	kprintf("HUMMER STUB: vr_verify_block reached; "
@@ -123,14 +129,14 @@ __attribute__((weak)) void boot_progress_poll(void)
 //
 // dev_t is 32-bit on arm64, so the int parameter is ABI-compatible with the
 // kernel's "extern int native_verified_block_root_authorized(dev_t)".
-extern "C" int native_verified_block_root_authorized(int device)
+extern "C" HUMMER_STUB_WEAK int native_verified_block_root_authorized(int device)
 {
 	(void)device;
 	return 1;
 }
 
 // Called from the verified-root probe patch when XNU_VERIFIED_ROOT_PROBE=1.
-extern "C" void native_verified_root_probe(void)
+extern "C" HUMMER_STUB_WEAK void native_verified_root_probe(void)
 {
 	kprintf("hummer: verified root probe (bring-up, no policy bundle)\n");
 }
