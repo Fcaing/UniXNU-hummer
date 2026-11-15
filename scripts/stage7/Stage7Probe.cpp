@@ -113,7 +113,12 @@ static void startKeyState(void) {
 // stack -- GPUCC power, SMMU, GMU+HFI, CP, ZAP, the ring, and the Metal service
 // -- and reads hummer-adreno-bringup itself, so an unset argument costs one
 // PE_parse_boot_argn and nothing else.
+#ifndef HUMMER_GPU_ARCHIVE_BUILT
+#define HUMMER_GPU_ARCHIVE_BUILT 0
+#endif
+#if HUMMER_GPU_ARCHIVE_BUILT
 extern "C" int hummer_gpu_start(void);
+#endif
 
 extern "C" void native_legacy_display_probe(void) {
     if(displayInitialized)return;
@@ -135,7 +140,14 @@ extern "C" void native_legacy_display_late_probe(void) {
     // IOKitBSDInit runs from bsd_autoconf, long after vfsinit. This is the board's
     // existing post-IOKit entry point, so the GPU work hangs here instead of
     // costing another XNU patch.
+    // hummer: only the board that builds the GPU archive links this symbol.
+    // A display-only kernel leaves hummer-adreno-bringup alone and must not
+    // carry an undefined reference here.
+#if HUMMER_GPU_ARCHIVE_BUILT
     progress("GPU start",(uint32_t)hummer_gpu_start());
+#else
+    progress("GPU start skipped",0);
+#endif
     // The offline HID source loads IOHIDFamily/IOHIDEventDriver itself whenever
     // offline-hid-input=1 is set, and only creates the device when that first load
     // succeeded - so it must run before anything else touches IOHID. Without that
