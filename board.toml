@@ -57,6 +57,8 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-native-aes.py",
   "build-native-ufs.py --root-windows",
+  # 原生 UFS 的 IOStorage ABI 链接桩（必须在 NativeUfs.o 之后跑：按 nm -u 生成占位符）。
+  "build-hummer-storage-stubs.py",
   "build-ufs-storage-bindings.py --kernelcache ../../ipsw/21H461/kernelcache.decompressed",
   "build-native-ufs.py --component NativeVirtioBlock --root-windows",
   "build-native-ufs.py --component NativeRamBlock --root-windows",
@@ -75,7 +77,6 @@ archives = [
   # CONFIG_XNU_ADRENO_FIRMWARE_PROBE=y 时 force-load 它，bsd_init 钩子调用
   # native_adreno_firmware_probe()）。开 boot arg hummer-adreno-probe=1 后该探针必 panic，
   # 把 kgsl/rscc/cxmisc/gpucc 四个窗口的读值留在屏上，等真机读回后撤掉本行与对应 kernel_arg。
-  "build-hummer-adreno-probe.py",
   # GPU 驱动的归档（XNU_NATIVE_ADRENO=y 时引擎 force-load build/native-adreno/
   # libNativeAdreno.a）。两块按顺序跑：
   #   1. 校验 firmware/hummer-gpu/ 里的四件套（gmu / sqe / aqe / zap）。它们随
@@ -93,8 +94,6 @@ archives = [
   #      （A8XX 性能表）+ kits/ArmSmmu4K + kits/AdrenoPM4 + package/ 里的
   #      SM8750 平台层（GPUCC 电源 / SMMU 规划 / ZAP / socinfo / OPP 票）与
   #      HummerGpu.cpp，把固件作为强符号一起归档。
-  "fetch-hummer-gpu-firmware.py",
-  "build-hummer-adreno-kits.py",
 ]
 
 [kernel.prelink]

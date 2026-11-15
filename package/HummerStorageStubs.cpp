@@ -106,7 +106,9 @@ int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, 
 }
 
 // NativeUfs declares this weak: absent in ordinary builds, a no-op by contract.
-void boot_progress_poll(void)
+// BootProgress (kits) provides the real one, so keep this definition weak: a
+// strong stub here collides with libBootProgress.a at link time.
+__attribute__((weak)) void boot_progress_poll(void)
 {
 }
 }

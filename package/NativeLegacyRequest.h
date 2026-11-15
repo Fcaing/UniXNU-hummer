@@ -122,11 +122,24 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
     // device stores (four per iteration) instead of byte-wise pixel assembly: the stores into device memory dominate.
     // The destination base and stride are 8-byte aligned in practice (checked here); otherwise 32-bit stores remain.
     int wide=!(dst&7) && !(destinationStride&7);
+    // v-fb-1: the store into the device mapping is the whole cost (a full 1264x2780
+    // frame is 14 MB and the uncached mapping moves 50-100 MB/s). Move 32 bytes per
+    // instruction with a paired NEON store so the write-combining buffer sees one
+    // access instead of the four 64-bit transaction slots below. Requires 16-byte
+    // rows only; the 64-bit and 32-bit fallbacks stay for every other geometry.
+    int wide32=!(dst&15) && !(destinationStride&15);
     for (uint32_t row=0;row<height;++row) {
         volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
         const unsigned char *in=(const unsigned char *)(src+row*sourceStride);
         uint32_t column=0;
-        if (wide) {
+        if (wide32) {
+            uintptr_t o=(uintptr_t)out;
+            for (;column+8<=width;column+=8) {
+                uintptr_t s2=(uintptr_t)(in+(uint64_t)column*4);
+                __asm__ volatile("ldp q0, q1, [%0]\n\tstp q0, q1, [%1]"
+                    :: "r"(s2), "r"(o+(uint64_t)column*4) : "v0","v1","memory");
+            }
+        } else if (wide) {
             volatile uint64_t *out64=(volatile uint64_t *)out;
             for (;column+8<=width;column+=8) {
                 uint64_t a,b,c,d;
