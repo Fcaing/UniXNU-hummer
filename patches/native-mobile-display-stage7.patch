@@ -1,6 +1,6 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -6,11 +6,16 @@
+@@ -6,11 +6,19 @@
  #include <IOKit/IOLib.h>
  #include <IOKit/IOMemoryDescriptor.h>
  #include <IOKit/IOWorkLoop.h>
@@ -10,6 +10,9 @@
  #include <IOKit/pwr_mgt/IOPMpowerState.h>
  #include <libkern/c++/OSData.h>
  #include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <kern/debug.h>
  extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 +// Slots the system calls but this backend does not implement: record and return instead of
 +// stopping the boot (they all return void).
@@ -17,7 +20,7 @@
  extern "C" IOService *native_legacy_display_allocate(void);
  extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
  extern "C" void native_legacy_registration_observed(IOService *);
-@@ -35,6 +40,16 @@
+@@ -35,6 +43,16 @@
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
  extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
  extern "C" void native_legacy_gpu_fallback_observed(int status);
@@ -34,7 +37,7 @@
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,8 +58,16 @@
+@@ -43,6 +61,111 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -42,16 +45,111 @@
 +    // every completed blit has to clean the written lines to the point of coherency
 +    // before the display engine scans them out of DRAM.
 +    bool bootCached=false;
++    // v-fb-4: the boot framebuffer is a single buffer, so a swap writes the memory the display
++    // engine is scanning out right now -- the panel shows that write as it travels down the
++    // frame, one line at a time, and every swap pays for a full frame. The loader reserved more
++    // splash memory than it uses; point the SSPP at the next megabyte-aligned block inside that
++    // reservation and alternate, so a finished frame only reaches the panel at the next refresh.
++    // The offsets are the SM8750 MDSS ones the mainline dpu1 driver uses (MDP at MDSS+0x1000).
++    static constexpr uint64_t flMdssPhys=0x0ae00000ULL,flMdssSize=0x94000ULL;
++    static constexpr uint64_t flSplashPhys=0xfc800000ULL,flSplashSize=0x2b00000ULL;
++    static constexpr unsigned flPipeCount=10;
++    static uint32_t flPipeBaseOf(unsigned p){static const uint32_t t[flPipeCount]={0x4000,0x6000,0x8000,0xa000,0x24000,0x26000,0x28000,0x2a000,0x2c000,0x2e000};return t[p];}
++    static uint32_t flPipeFlushOf(unsigned p){static const uint32_t t[flPipeCount]={1u<<0,1u<<1,1u<<2,1u<<18,1u<<11,1u<<12,1u<<24,1u<<25,1u<<13,1u<<14};return t[p];}
++    vm_offset_t flMdss=0;
++    uint64_t flPa[2]={0,0};
++    IOMemoryMap *flMap=nullptr;
++    uint8_t *flVa[2]={nullptr,nullptr};
++    bool flCached[2]={false,false};
++    uint64_t flBytes=0;
++    uint32_t flPipes=0,flFlush=0,flCtl=0;
++    uint32_t flOffset[flPipeCount]={0,0,0,0,0,0,0,0,0,0};
++    int flShown=0;
++    bool flReady=false,flNeedStart=false;
++    static uint32_t flRd(uint64_t a){return *(volatile uint32_t *)(uintptr_t)a;}
++    static void flWr(uint64_t a,uint32_t v){*(volatile uint32_t *)(uintptr_t)a=v;}
++    uint64_t flMdp() const {return (uint64_t)flMdss+0x1000;}
++    uint64_t flCtlAt(unsigned n) const {return flMdp()+0x15000+0x1000ull*n;}
++    uint64_t flIntfAt(unsigned n) const {return flMdp()+0x34000+0x1000ull*n;}
++    uint64_t flPipeAt(unsigned p) const {return flMdp()+flPipeBaseOf(p);}
++    // Where this swap draws: the buffer off screen once the pair is live.
++    volatile void *flipDest(){if(flReady)return (flShown==0)?(volatile void *)flVa[1]:(volatile void *)bootMapping->getVirtualAddress();return (volatile void *)bootMapping->getVirtualAddress();}
++    uint64_t flipDestBytes(){return flReady?flBytes:bootMapping->getLength();}
++    bool flipDestCached(){return flReady?flCached[flShown^1]:bootCached;}
++    // Until CTL has taken the flush (its bits clear at the refresh that latches them).
++    bool flipTaken(uint32_t limitUs){
++        for(uint32_t waited=0;waited<limitUs;waited+=50){
++            if((flRd(flCtlAt(flCtl)+0x018)&flFlush)==0)return true;
++            delay(50);
++        }
++        return (flRd(flCtlAt(flCtl)+0x018)&flFlush)==0;
++    }
++    // The pipes onto buffer WHICH, taken at the next refresh.
++    void flipPoint(int which){
++        __asm__ volatile("dsb sy":::"memory");
++        for(unsigned p=0;p<flPipeCount;p++)
++            if(flPipes&(1u<<p))flWr(flPipeAt(p)+0x014,(uint32_t)(flPa[which]+flOffset[p]));
++        flWr(flCtlAt(flCtl)+0x018,flFlush);
++        if(flNeedStart)flWr(flCtlAt(flCtl)+0x01c,1);
++        flShown=which;
++    }
++    void flipStart(uint64_t fb,uint8_t *fbBase,uint32_t bytes){
++        unsigned want=0;PE_parse_boot_argn("fb_flip",&want,sizeof want);
++        if(want<1||!fb||!fbBase||!bytes)return;
++        flMdss=ml_io_map((vm_offset_t)flMdssPhys,(vm_size_t)flMdssSize);
++        if(!flMdss){panic("FBLK no mdss");}
++        uint64_t b=(fb+(uint64_t)bytes+0xfffffULL)&~0xfffffULL;
++        if(want==1){
++            panic("FBLK mdss %08x fb %08x bytes %08x b %08x | ctl0 intf %08x fetch %08x | p0 addr %08x size %08x str %08x | p1 addr %08x size %08x | intf1 %08x intf2 %08x",
++                flRd(flMdp()), (uint32_t)fb, bytes, (uint32_t)b,
++                flRd(flCtlAt(0)+0x0f4), flRd(flCtlAt(0)+0x0fc),
++                flRd(flPipeAt(0)+0x014), flRd(flPipeAt(0)+0x000), flRd(flPipeAt(0)+0x024),
++                flRd(flPipeAt(1)+0x014), flRd(flPipeAt(1)+0x000),
++                flRd(flIntfAt(1)+0x0ac), flRd(flIntfAt(2)+0x0ac));
++        }
++        if(fb<flSplashPhys||(b+(uint64_t)bytes)>flSplashPhys+flSplashSize){
++            panic("FBLK not in splash fb %08x b %08x end %08x", (uint32_t)fb, (uint32_t)b,
++                (uint32_t)(b+(uint64_t)bytes));
++        }
++        flPa[0]=fb;flPa[1]=b;flBytes=(uint64_t)bytes;
++        flVa[0]=fbBase;flCached[0]=bootCached;
++        IOMemoryDescriptor *desc=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)b,(IOByteCount)bytes,kIODirectionOut);
++        if(desc){
++            flMap=desc->map(kIOMapAnywhere|kIOMapCopybackCache);
++            desc->release();
++            if(flMap)flVa[1]=(uint8_t *)flMap->getVirtualAddress();
++        }
++        flCached[1]=(flVa[1]!=nullptr);
++        if(!flVa[1]){
++            flVa[1]=(uint8_t *)ml_io_map_wcomb((vm_offset_t)b,(vm_size_t)bytes);
++            flCached[1]=false;
++        }
++        if(!flVa[1])panic("FBLK no second buffer %08x", (uint32_t)b);
++        // The pipes the loader pointed at the boot framebuffer (or at B, from an earlier boot).
++        for(unsigned p=0;p<flPipeCount;p++){
++            uint32_t at=flRd(flPipeAt(p)+0x014),size=flRd(flPipeAt(p)+0x000);
++            if(!size||!at)continue;
++            if((at>=fb&&at<fb+(uint64_t)bytes)||(at>=b&&at<b+(uint64_t)bytes)){
++                flPipes|=1u<<p;flFlush|=flPipeFlushOf(p);
++                flOffset[p]=(uint32_t)(at-((at>=b)?b:fb));
++            }
++        }
++        for(flCtl=0;flCtl<6;flCtl++)if(flRd(flCtlAt(flCtl)+0x0f4)&0x6)break;
++        if(!flPipes||flCtl==6)panic("FBLK pipes %08x ctl %u (p0 %08x p1 %08x)",
++            flPipes, flCtl, flRd(flPipeAt(0)+0x014), flRd(flPipeAt(1)+0x014));
++        flFlush|=1u<<17;
++        flipPoint(0);
++        if(!flipTaken(50000)){
++            flNeedStart=true;flipPoint(0);
++            if(!flipTaken(50000))panic("FBLK no flush %08x", flRd(flCtlAt(flCtl)+0x018));
++        }
++        flReady=true;
++    }
++    void flipStop(){if(flMap){flMap->release();flMap=nullptr;}flVa[1]=nullptr;flReady=false;}
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
-+    // v-fb-3: one content hash per source row. A row whose hash still matches the previous frame is not
-+    // stored to the scanout window at all, so a mostly static screen touches a few hundred KB instead of all
-+    // 14 MB and the display engine is not overwritten along its own scan line for the whole blit.
-+    uint64_t *rowHashes=nullptr;uint32_t rowHashRows=0;bool rowHashesValid=false;
      bool primary=false;
-     bool logicalPM=false;
-     bool transferred=false;
-@@ -66,6 +89,55 @@
+@@ -66,6 +189,55 @@
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -107,72 +205,20 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,8 +148,63 @@
+@@ -76,9 +248,11 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
 -    void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
-+    // v-fb-3: store only the source rows whose content changed since the previous blit and report the first and
-+    // last row written, so the cache clean that follows can be limited to them. Returns false when the geometry
-+    // needs the plain copy. The destination base and stride are checked for the wide stores here.
-+    bool copyChangedRows(uint32_t cw,uint32_t ch,uint64_t dstStride,uintptr_t dst,
-+        const unsigned char *src,uint64_t srcStride,int shadowsValid,uint32_t *firstRow,
-+        uint32_t *lastRow,uint64_t *storedBytes) {
-+        const uint32_t rowBytes=cw*4;
-+        if(!rowHashes || rowHashRows<ch || (rowBytes&3)) return false;
-+        uint32_t first=ch,last=0;uint64_t stored=0;
-+        for(uint32_t row=0;row<ch;++row) {
-+            const unsigned char *in=src+(uint64_t)row*srcStride;
-+            uint64_t h=1469598103934665603ull;
-+            uint32_t i=0;
-+            for(;i+32<=rowBytes;i+=32) {
-+                uint64_t a,b,c,d;
-+                __builtin_memcpy(&a,in+i,8);__builtin_memcpy(&b,in+i+8,8);
-+                __builtin_memcpy(&c,in+i+16,8);__builtin_memcpy(&d,in+i+24,8);
-+                h=(h^a)*1099511628211ull;h=(h^b)*1099511628211ull;
-+                h=(h^c)*1099511628211ull;h=(h^d)*1099511628211ull;
-+            }
-+            for(;i+8<=rowBytes;i+=8) {uint64_t v;__builtin_memcpy(&v,in+i,8);h=(h^v)*1099511628211ull;}
-+            if(shadowsValid && rowHashes[row]==h) continue;
-+            rowHashes[row]=h;
-+            uintptr_t o=dst+(uint64_t)row*dstStride;
-+            if(!(o&15) && !(rowBytes&15)) {
-+                // The kernel is built -mgeneral-regs-only, so no NEON here: two integer
-+                // register pairs per 16 bytes, which the compiler turns into ldp/stp.
-+                for(uint32_t col=0;col<rowBytes;col+=16) {
-+                    uint64_t a,b;
-+                    __builtin_memcpy(&a,in+col,8);__builtin_memcpy(&b,in+col+8,8);
-+                    volatile uint64_t *q=(volatile uint64_t *)(o+col);
-+                    q[0]=a;q[1]=b;
-+                }
-+            } else if(!(o&7) && !(rowBytes&7)) {
-+                volatile uint64_t *out=(volatile uint64_t *)o;
-+                for(uint32_t col=0;col<rowBytes;col+=8) {
-+                    uint64_t v;__builtin_memcpy(&v,in+col,8);out[col/8]=v;
-+                }
-+            } else {
-+                volatile uint32_t *out=(volatile uint32_t *)o;
-+                for(uint32_t col=0;col<rowBytes;col+=4) {
-+                    uint32_t v;__builtin_memcpy(&v,in+col,4);out[col/4]=v;
-+                }
-+            }
-+            stored+=rowBytes;
-+            if(row<first)first=row;
-+            last=row;
-+        }
-+        if(firstRow)*firstRow=first;
-+        if(lastRow)*lastRow=last;
-+        if(storedBytes)*storedBytes=stored;
-+        return true;
-+    }
-+    void free() override {stopVsync();if(rowHashes){IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));rowHashes=nullptr;rowHashRows=0;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
++    void free() override {flipStop();stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
      void stop(IOService *provider) override {
 +        stopVsync();
-+        if(rowHashes){IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));rowHashes=nullptr;rowHashRows=0;}
          transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
++        flipStop();
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
-@@ -93,6 +220,10 @@
+     }
+@@ -93,6 +267,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -183,7 +229,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +258,29 @@
+@@ -127,14 +305,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -213,77 +259,65 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -231,6 +377,30 @@
+@@ -169,7 +362,7 @@
+                 native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+             }
+             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+-            if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
++            if(!native_legacy_fill_pixels(flipDest(),
+                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
+                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+             }
+@@ -211,7 +404,7 @@
+         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
-         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
-         uint64_t stored=UINT64_MAX;
-+        // v-fb-3: hash each source row and store only the rows that changed (default on; sheng-fb-rows=0
-+        // restores the plain full-frame blit). The cache clean below is limited to the rows written here.
-+        uint32_t dirtyFirst=height,dirtyLast=0;bool dirtyKnown=false;
-+        {
-+            static int rowsOff=-1;
-+            if(rowsOff<0) {unsigned v=1;PE_parse_boot_argn("sheng-fb-rows",&v,sizeof v);rowsOff=(v==0);}
-+            uint64_t rowsNeed=(uint64_t)width*height*4;
-+            if(!rowsOff && rowsNeed<=(64ull<<20)) {
-+                if(!rowHashes || rowHashRows<height) {
-+                    if(rowHashes && rowHashRows) IOFreeAligned(rowHashes,(vm_size_t)((uint64_t)rowHashRows*8));
-+                    rowHashes=nullptr;rowHashRows=0;rowHashesValid=false;
-+                    rowHashes=(uint64_t *)IOMallocAligned((vm_size_t)((uint64_t)height*8),64);
-+                    if(rowHashes) rowHashRows=height;
-+                }
-+                uint32_t f=height,l=0;uint64_t bytes=0;
-+                if(rowHashes && copyChangedRows(width,height,video.v_rowBytes,
-+                    (uintptr_t)(uint64_t)bootMapping->getVirtualAddress(),
-+                    reinterpret_cast<const unsigned char *>(source->getVirtualAddress()),sourceStride,
-+                    rowHashesValid,&f,&l,&bytes)) {
-+                    rowHashesValid=true;stored=bytes;
-+                    if(bytes) {dirtyFirst=f;dirtyLast=l;dirtyKnown=true;}
-+                }
-+            }
-+        }
-         {
-             // Store only what changed since the previous frame (the scanout memory is slow device memory).
-             uint64_t need=(uint64_t)width*height*4;
-@@ -239,8 +409,8 @@
-             // lock screen that disappeared with the plain copy (int-005).
-             static int diffOff=-1;
+-        if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
++        if(!native_legacy_copy_layout(flipDest(),
+             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+             source->getLength(),sourceStride,width,height)) {
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+@@ -241,14 +434,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
--            if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
--            if(!diffOff && shadow && shadowBytes>=need)
-+            if(stored==UINT64_MAX && !diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
-+            if(stored==UINT64_MAX && !diffOff && shadow && shadowBytes>=need)
-                 stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+             if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
+             if(!diffOff && shadow && shadowBytes>=need)
+-                stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
++                stored=native_legacy_copy_diff(flipDest(),
                      bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                      source->getLength(),sourceStride,width,height,shadow,shadowValid);
-@@ -256,6 +426,27 @@
+             if(stored!=UINT64_MAX)shadowValid=true;
+         }
+         if(stored==UINT64_MAX) {
+             shadowValid=false;
+-            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
++            if(!native_legacy_copy_pixels(flipDest(),
+                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                 source->getLength(),sourceStride,width,height)) {
+                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+@@ -256,6 +449,22 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
-+        if(bootCached && bootMapping) {
-+            // Clean-and-invalidate what the blit wrote back to the point of coherency: the scanout engine
-+            // reads DRAM, not our caches. 64-byte lines are what the arm64 cores Apple and Qualcomm ship here
-+            // use. v-fb-3 limits the clean to the rows the row-hash path actually stored.
-+            uintptr_t cleanStart=0,cleanEnd=0;bool doClean=true;
-+            if(dirtyKnown) {
-+                uintptr_t base=(uintptr_t)bootMapping->getVirtualAddress();
-+                cleanStart=(base+(uintptr_t)dirtyFirst*video.v_rowBytes)&~(uintptr_t)63;
-+                cleanEnd=base+((uintptr_t)dirtyLast+1)*video.v_rowBytes;
-+            } else if(stored==0 && rowHashesValid) {
-+                doClean=false;
-+            } else {
-+                cleanStart=(uintptr_t)bootMapping->getVirtualAddress() & ~(uintptr_t)63;
-+                cleanEnd=(uintptr_t)bootMapping->getVirtualAddress()+bootMapping->getLength();
-+            }
-+            if(doClean) {
-+                for(uintptr_t line=cleanStart;line<cleanEnd;line+=64)
-+                    __asm__ volatile("dc civac, %0"::"r"(line):"memory");
-+                __asm__ volatile("dsb sy" ::: "memory");
-+            }
++        if(flipDestCached()) {
++            // Clean-and-invalidate every line the blit wrote back to the point of
++            // coherency: the scanout engine reads DRAM, not our caches. 64-byte lines
++            // are what the arm64 cores Apple and Qualcomm ship here use.
++            uintptr_t cleanStart=(uintptr_t)flipDest() & ~(uintptr_t)63;
++            uintptr_t cleanEnd=(uintptr_t)flipDest()+flipDestBytes();
++            for(uintptr_t line=cleanStart;line<cleanEnd;line+=64)
++                __asm__ volatile("dc civac, %0"::"r"(line):"memory");
++            __asm__ volatile("dsb sy" ::: "memory");
++        }
++        if(flReady) {
++            // The finished frame is in the buffer off screen: point the pipes at it and wait
++            // for the refresh that latches the flush, so the next swap cannot overwrite it.
++            flipPoint(flShown^1);
++            flipTaken(40000);
 +        }
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +578,19 @@
+@@ -387,7 +596,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -304,11 +338,12 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +600,13 @@
+@@ -397,12 +618,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
 +                bootCached=cached;
++                flipStart(video.v_baseAddr,(uint8_t *)bootMapping->getVirtualAddress(),(uint32_t)bootMapping->getLength());
                  valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
              }
          }
