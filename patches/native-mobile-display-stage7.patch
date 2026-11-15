@@ -35,7 +35,7 @@
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,6 +59,157 @@
+@@ -43,6 +59,168 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -54,8 +54,9 @@
 +    static uint64_t flSplashPhys(){return 0xfc800000ULL;}
 +    static uint64_t flSplashSize(){return 0x2b00000ULL;}
 +    static constexpr unsigned flPipeCount=10;
-+    static uint32_t flPipeBaseOf(unsigned p){static const uint32_t t[flPipeCount]={0x4000,0x6000,0x8000,0xa000,0x24000,0x26000,0x28000,0x2a000,0x2c000,0x2e000};return t[p];}
-+    static uint32_t flPipeFlushOf(unsigned p){static const uint32_t t[flPipeCount]={1u<<0,1u<<1,1u<<2,1u<<18,1u<<11,1u<<12,1u<<24,1u<<25,1u<<13,1u<<14};return t[p];}
++    struct FlPipe{uint32_t base,addr,size,stride;};
++    FlPipe flFound[8];
++    unsigned flFoundCount=0;
 +    IOMemoryMap *flMdssMap=nullptr;
 +    uint8_t *flMdss=nullptr;
 +    uint64_t flPa[2]={0,0};
@@ -64,7 +65,7 @@
 +    bool flCached[2]={false,false};
 +    uint64_t flBytes=0;
 +    uint32_t flPipes=0,flFlush=0,flCtl=0;
-+    uint32_t flOffset[flPipeCount]={0,0,0,0,0,0,0,0,0,0};
++    uint32_t flOffset[8]={0,0,0,0,0,0,0,0};
 +    int flShown=0;
 +    bool flReady=false,flNeedStart=false;
 +    IOMemoryMap *flGccMap=nullptr,*flDispccMap=nullptr;
@@ -112,7 +113,6 @@
 +    uint64_t flMdp() const {return (uint64_t)(uintptr_t)flMdss+0x1000;}
 +    uint64_t flCtlAt(unsigned n) const {return flMdp()+0x15000+0x1000ull*n;}
 +    uint64_t flIntfAt(unsigned n) const {return flMdp()+0x34000+0x1000ull*n;}
-+    uint64_t flPipeAt(unsigned p) const {return flMdp()+flPipeBaseOf(p);}
 +    // Where this swap draws: the buffer off screen once the pair is live.
 +    volatile void *flipDest(){if(flReady)return (flShown==0)?(volatile void *)flVa[1]:(volatile void *)bootMapping->getVirtualAddress();return (volatile void *)bootMapping->getVirtualAddress();}
 +    uint64_t flipDestBytes(){return flReady?flBytes:bootMapping->getLength();}
@@ -128,11 +128,25 @@
 +    // The pipes onto buffer WHICH, taken at the next refresh.
 +    void flipPoint(int which){
 +        __asm__ volatile("dsb sy":::"memory");
-+        for(unsigned p=0;p<flPipeCount;p++)
-+            if(flPipes&(1u<<p))flWr(flPipeAt(p)+0x014,(uint32_t)(flPa[which]+flOffset[p]));
++        for(unsigned i=0;i<flFoundCount;i++)
++            flWr(flMdp()+flFound[i].base+0x014,(uint32_t)(flPa[which]+flOffset[i]));
 +        flWr(flCtlAt(flCtl)+0x018,flFlush);
 +        if(flNeedStart)flWr(flCtlAt(flCtl)+0x01c,1);
 +        flShown=which;
++    }
++    // Walk the MDP register space for source pipes that read this framebuffer (or the second one).
++    void flScan(uint64_t fb,uint64_t bytes,uint64_t second){
++        flFoundCount=0;
++        for(uint32_t off=0x1000;off<0x60000&&flFoundCount<8;off+=0x1000){
++            uint32_t at=flRd(flMdp()+off+0x014);
++            uint32_t size=flRd(flMdp()+off+0x000);
++            if(!at||!size)continue;
++            if((at>=fb&&at<fb+bytes)||(second&&at>=second&&at<second+bytes)){
++                FlPipe &p=flFound[flFoundCount++];
++                p.base=off;p.addr=at;p.size=size;p.stride=flRd(flMdp()+off+0x024);
++                flOffset[flFoundCount-1]=(uint32_t)(at-((second&&at>=second)?second:fb));
++            }
++        }
 +    }
 +    void flipStart(uint64_t fb,uint8_t *fbBase,uint32_t bytes){
 +        unsigned want=0;PE_parse_boot_argn("fb_flip",&want,sizeof want);
@@ -146,13 +160,14 @@
 +            gccB,gccA,gdsc,brB,brA,(uint32_t)fb);
 +        if(!flMdss)panic("FBLK no mdss window");
 +        if(want==1){
-+            panic("FBLK clk %08x gdsc %08x fb %08x bytes %08x b %08x mdss %08x mdp %08x | ctl0 i %08x f %08x | p0 %08x %08x %08x | p1 %08x %08x | intf1 %08x",
++            flScan(fb,(uint64_t)bytes,b);
++            panic("FBLK clk %08x gdsc %08x fb %08x by %08x b %08x | ctl %u i %08x f %08x | n %u %08x:%08x:%08x | %08x:%08x:%08x | %08x:%08x:%08x",
 +                gccA, gdsc, (uint32_t)fb, bytes, (uint32_t)b,
-+                flRd(flMdp()-0x1000), flRd(flMdp()),
-+                flRd(flCtlAt(0)+0x0f4), flRd(flCtlAt(0)+0x0fc),
-+                flRd(flPipeAt(0)+0x014), flRd(flPipeAt(0)+0x000), flRd(flPipeAt(0)+0x024),
-+                flRd(flPipeAt(1)+0x014), flRd(flPipeAt(1)+0x000),
-+                flRd(flIntfAt(1)+0x0ac));
++                flCtl, flCtl<6?flRd(flCtlAt(flCtl)+0x0f4):0, flCtl<6?flRd(flCtlAt(flCtl)+0x0fc):0,
++                flFoundCount,
++                flFoundCount>0?flFound[0].base:0, flFoundCount>0?flFound[0].addr:0, flFoundCount>0?flFound[0].size:0,
++                flFoundCount>1?flFound[1].base:0, flFoundCount>1?flFound[1].addr:0, flFoundCount>1?flFound[1].size:0,
++                flFoundCount>2?flFound[2].base:0, flFoundCount>2?flFound[2].addr:0, flFoundCount>2?flFound[2].size:0);
 +        }
 +        if(fb<flSplashPhys()||(b+(uint64_t)bytes)>flSplashPhys()+flSplashSize()){
 +            panic("FBLK not in splash fb %08x b %08x end %08x", (uint32_t)fb, (uint32_t)b,
@@ -169,18 +184,14 @@
 +            flCached[1]=false;
 +        }
 +        if(!flVa[1])panic("FBLK no second buffer %08x", (uint32_t)b);
-+        // The pipes the loader pointed at the boot framebuffer (or at B, from an earlier boot).
-+        for(unsigned p=0;p<flPipeCount;p++){
-+            uint32_t at=flRd(flPipeAt(p)+0x014),size=flRd(flPipeAt(p)+0x000);
-+            if(!size||!at)continue;
-+            if((at>=fb&&at<fb+(uint64_t)bytes)||(at>=b&&at<b+(uint64_t)bytes)){
-+                flPipes|=1u<<p;flFlush|=flPipeFlushOf(p);
-+                flOffset[p]=(uint32_t)(at-((at>=b)?b:fb));
-+            }
-+        }
++        // Every source pipe whose address lands in our buffer, found by walking the MDP register
++        // space: the loader's pipe ids are not the ones a fixed table would guess.
++        flScan(fb,(uint64_t)bytes,b);
 +        for(flCtl=0;flCtl<6;flCtl++)if(flRd(flCtlAt(flCtl)+0x0f4)&0x6)break;
-+        if(!flPipes||flCtl==6)panic("FBLK pipes %08x ctl %u (p0 %08x p1 %08x)",
-+            flPipes, flCtl, flRd(flPipeAt(0)+0x014), flRd(flPipeAt(1)+0x014));
++        if(!flFoundCount||flCtl==6)panic("FBLK scan %u ctl %u fetch %08x",
++            flFoundCount, flCtl, flCtl<6?flRd(flCtlAt(flCtl)+0x0fc):0);
++        // The flush bits the loader's own last frame used tell us which sources CTL tracks.
++        flFlush=flRd(flCtlAt(flCtl)+0x0fc);
 +        flFlush|=1u<<17;
 +        flipPoint(0);
 +        if(!flipTaken(50000)){
@@ -193,7 +204,7 @@
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
-@@ -66,6 +233,55 @@
+@@ -66,6 +244,55 @@
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -249,7 +260,7 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,9 +292,11 @@
+@@ -76,9 +303,11 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -262,7 +273,7 @@
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
      }
-@@ -93,6 +311,10 @@
+@@ -93,6 +322,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -273,7 +284,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +349,29 @@
+@@ -127,14 +360,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -303,7 +314,7 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -169,7 +406,7 @@
+@@ -169,7 +417,7 @@
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
              if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
@@ -312,7 +323,7 @@
                  bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                  native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
              }
-@@ -211,7 +448,7 @@
+@@ -211,7 +459,7 @@
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
@@ -321,7 +332,7 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -241,14 +478,14 @@
+@@ -241,14 +489,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -338,7 +349,7 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,6 +493,22 @@
+@@ -256,6 +504,22 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -361,7 +372,7 @@
          {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +640,19 @@
+@@ -387,7 +651,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -382,7 +393,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +662,14 @@
+@@ -397,12 +673,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
