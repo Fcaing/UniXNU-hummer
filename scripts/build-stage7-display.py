@@ -240,12 +240,12 @@ objects+=[presenter_late,dpu]
 # The Pagani panel/input peripherals belong to the 13T board. Hummer drives its own
 # panel through the legacy presenter and its touch controller from package/, so the
 # peripheral pass is only run when those drivers are actually present.
-if (ROOT/'drivers/PaganiInput').exists():
+if (ROOT/'kits/oneplus13t').exists():
     print(run(['python3',ROOT/'scripts/build-pagani-peripherals.py','--kernelcache',args.kernelcache],text=True),end='')
     peripherals=ROOT/'build/pagani-peripherals'
     objects += [peripherals/name for name in ('PaganiInput.late.o','PaganiPanel.late.o','PaganiS3910.o','PaganiGeniSpi.o','peripheral-bindings.o')]
 else:
-    print('stage7-display: Pagani peripherals absent on this board, skipped',end='\n')
+    print('stage7-display: not the 13T board, Pagani peripheral pass skipped',end='\n')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,*objects])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
@@ -256,10 +256,13 @@ sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
          ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',
          ROOT/'drivers/Stage7Probe/Stage7Probe.cpp',Path(__file__),
          ROOT/'scripts/build-stage7-driver.py',ROOT/'scripts/original_stage7.py',ROOT/'scripts/audit-stage7-display.py']
-sources += [ROOT/'scripts/build-pagani-peripherals.py', ROOT/'kits/oneplus13t/PaganiPeripherals.h',
-            ROOT/'kits/Sm8750Platform/PeripheralIO.h', ROOT/'drivers/QcomGeniSpi/GeniSpi.c', ROOT/'drivers/QcomGeniSpi/GeniSpi.h']
+# Board-specific peripherals only exist on the 13T feed; hash whatever this tree has.
+sources += [p for p in (ROOT/'scripts/build-pagani-peripherals.py', ROOT/'kits/oneplus13t/PaganiPeripherals.h',
+            ROOT/'kits/Sm8750Platform/PeripheralIO.h', ROOT/'drivers/QcomGeniSpi/GeniSpi.c', ROOT/'drivers/QcomGeniSpi/GeniSpi.h')
+            if p.exists()]
 for folder in ('PaganiInput','PaganiPanel'):
-    sources += sorted(p for p in (ROOT/'drivers'/folder).iterdir() if p.suffix in ('.cpp','.c','.h'))
+    if (ROOT/'drivers'/folder).exists():
+        sources += sorted(p for p in (ROOT/'drivers'/folder).iterdir() if p.suffix in ('.cpp','.c','.h'))
 (OUT/'build-report.json').write_text(json.dumps(dict(original_sha256=original.sha256,
     archive_sha256=sha(archive),source_sha256={str(p.relative_to(ROOT)):sha(p) for p in sources},
     virtual_entries=358,owned_entries=owned,bindings={n:hex(v) for n,v in bindings.items()},
