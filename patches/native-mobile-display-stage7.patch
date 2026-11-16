@@ -485,7 +485,7 @@
 +    // v-fb-10: with a cached source and a cached destination a straight memcpy per row is the
 +    // fastest form (14 MB in well under a millisecond); the word loops below stay for the rest.
 +    if(!(dst&15) && !(destinationStride&15) && !(src&15) && !(sourceStride&15) && !(width&3)) {
-+        size_t rowBytes=(size_t)width*4;
++        uint64_t rowBytes=(uint64_t)width*4;
 +        for (uint32_t row=0;row<height;++row)
 +            __builtin_memcpy((void *)(dst+row*destinationStride),(const void *)(src+row*sourceStride),rowBytes);
 +        return 1;
