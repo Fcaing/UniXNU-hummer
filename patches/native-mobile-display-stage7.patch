@@ -35,7 +35,7 @@
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
  static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-@@ -43,6 +59,168 @@
+@@ -43,6 +59,178 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -68,6 +68,9 @@
 +    uint32_t flOffset[8]={0,0,0,0,0,0,0,0};
 +    int flShown=0;
 +    bool flReady=false,flNeedStart=false;
++    // fb_diag=1: measure what a swap really costs and how often one happens, then show it.
++    int dgOn=-1;
++    uint64_t dgStart=0,dgFrames=0,dgTicks=0,dgMax=0,dgMin=~0ull;
 +    IOMemoryMap *flGccMap=nullptr,*flDispccMap=nullptr;
 +    uint8_t *flGcc=nullptr,*flDispcc=nullptr;
 +    static bool flBranchOn(uint8_t *cbcr,uint32_t *before,uint32_t *after){
@@ -135,9 +138,13 @@
 +        flShown=which;
 +    }
 +    // Walk the MDP register space for source pipes that read this framebuffer (or the second one).
++    // VIG0..VIG3, DMA0..DMA5 as the loader lays them out, then the two spare banks. Reading windows
++    // the loader never powered resets the board, so the walk is limited to these.
++    static const uint32_t *flWindowTable(){static const uint32_t t[14]={0x4000,0x6000,0x8000,0xa000,0x24000,0x26000,0x28000,0x2a000,0x2c000,0x2e000,0x30000,0x32000,0xc000,0xe000};return t;}
 +    void flScan(uint64_t fb,uint64_t bytes,uint64_t second){
 +        flFoundCount=0;
-+        for(uint32_t off=0x1000;off<0x60000&&flFoundCount<8;off+=0x1000){
++        for(unsigned i=0;i<14&&flFoundCount<8;i++){
++            uint32_t off=flWindowTable()[i];
 +            uint32_t at=flRd(flMdp()+off+0x014);
 +            uint32_t size=flRd(flMdp()+off+0x000);
 +            if(!at||!size)continue;
@@ -160,14 +167,17 @@
 +            gccB,gccA,gdsc,brB,brA,(uint32_t)fb);
 +        if(!flMdss)panic("FBLK no mdss window");
 +        if(want==1){
-+            flScan(fb,(uint64_t)bytes,b);
-+            panic("FBLK clk %08x gdsc %08x fb %08x by %08x b %08x | ctl %u i %08x f %08x | n %u %08x:%08x:%08x | %08x:%08x:%08x | %08x:%08x:%08x",
-+                gccA, gdsc, (uint32_t)fb, bytes, (uint32_t)b,
++            // Only the CTL block and the two spare SSPP banks are read here: everything else the
++            // loader left unpowered resets the board when a read lands on it.
++            uint32_t L0=flRd(flCtlAt(0)+0x000),L1=flRd(flCtlAt(0)+0x004),
++                     L2=flRd(flCtlAt(0)+0x008),L3=flRd(flCtlAt(0)+0x00c),
++                     L4=flRd(flCtlAt(0)+0x010),L5=flRd(flCtlAt(0)+0x014);
++            uint64_t s1=flMdp()+0x30000+0x014,s1s=flMdp()+0x30000+0x000;
++            uint64_t s2=flMdp()+0x32000+0x014,s2s=flMdp()+0x32000+0x000;
++            uint32_t a1=flRd(s1),z1=flRd(s1s),a2=flRd(s2),z2=flRd(s2s);
++            panic("FBLK ctl %u i %08x f %08x | L %08x %08x %08x %08x %08x %08x | 30 %08x %08x | 32 %08x %08x",
 +                flCtl, flCtl<6?flRd(flCtlAt(flCtl)+0x0f4):0, flCtl<6?flRd(flCtlAt(flCtl)+0x0fc):0,
-+                flFoundCount,
-+                flFoundCount>0?flFound[0].base:0, flFoundCount>0?flFound[0].addr:0, flFoundCount>0?flFound[0].size:0,
-+                flFoundCount>1?flFound[1].base:0, flFoundCount>1?flFound[1].addr:0, flFoundCount>1?flFound[1].size:0,
-+                flFoundCount>2?flFound[2].base:0, flFoundCount>2?flFound[2].addr:0, flFoundCount>2?flFound[2].size:0);
++                L0,L1,L2,L3,L4,L5,a1,z1,a2,z2);
 +        }
 +        if(fb<flSplashPhys()||(b+(uint64_t)bytes)>flSplashPhys()+flSplashSize()){
 +            panic("FBLK not in splash fb %08x b %08x end %08x", (uint32_t)fb, (uint32_t)b,
@@ -204,7 +214,7 @@
      uint32_t scanBudget=32;
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
-@@ -66,6 +244,55 @@
+@@ -66,6 +254,55 @@
      const OriginalLegacySwapRequest *gpuRequest=nullptr;
      uint64_t gpuLength=0;
      bool gpuBypass=false;
@@ -260,7 +270,7 @@
  public:
      // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
      void gpuComplete(int status) {
-@@ -76,9 +303,11 @@
+@@ -76,9 +313,11 @@
          };
          if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
      }
@@ -273,7 +283,7 @@
          if(logicalPM){PMstop();logicalPM=false;}
          primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
      }
-@@ -93,6 +322,10 @@
+@@ -93,6 +332,10 @@
          setter(this,&request,false);
      }
      bool start(IOService *provider) override {
@@ -284,7 +294,7 @@
          if(!IOMobileFramebufferLegacy::start(provider))return false;
          if(primary && bootMapping)announcePoweredByFirmware();
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
-@@ -127,14 +360,29 @@
+@@ -127,14 +370,29 @@
      void registerService(IOOptionBits options=0) override {
          unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
          if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
@@ -314,7 +324,7 @@
          if(kicking){rekick=true;return;}
          kicking=true;
          do {
-@@ -169,7 +417,7 @@
+@@ -169,7 +427,7 @@
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
              if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
@@ -323,7 +333,7 @@
                  bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                  native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
              }
-@@ -211,7 +459,7 @@
+@@ -211,7 +469,7 @@
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
@@ -332,7 +342,17 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -241,14 +489,14 @@
+@@ -229,7 +487,9 @@
+         if(!native_legacy_prepare_scanout()) {
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+         }
++        if(dgOn<0){unsigned v=0;PE_parse_boot_argn("fb_diag",&v,sizeof v);dgOn=(v==1);}
+         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
++        if(dgOn && !dgStart)dgStart=copyStart;
+         uint64_t stored=UINT64_MAX;
+         {
+             // Store only what changed since the previous frame (the scanout memory is slow device memory).
+@@ -241,14 +501,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -349,10 +369,11 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,6 +504,22 @@
+@@ -256,7 +516,34 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
+-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
 +        if(flipDestCached()) {
 +            // Clean-and-invalidate every line the blit wrote back to the point of
 +            // coherency: the scanout engine reads DRAM, not our caches. 64-byte lines
@@ -369,10 +390,22 @@
 +            flipPoint(flShown^1);
 +            flipTaken(40000);
 +        }
-         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
++        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);
++            if(dgOn){
++                uint64_t dt=copyEnd-copyStart;
++                ++dgFrames;dgTicks+=dt;if(dt>dgMax)dgMax=dt;if(dt<dgMin)dgMin=dt;
++                // 24 MHz timebase: 24 ticks per microsecond.
++                if(copyEnd-dgStart>=24000000ull*10ull)
++                    panic("FBTM n %u avg %u us max %u min %u | dst %08x cached %u stride %u wh %ux%u src %08x ss %u stored %u",
++                        (uint32_t)dgFrames,(uint32_t)(dgTicks/dgFrames/24),(uint32_t)(dgMax/24),(uint32_t)(dgMin/24),
++                        (uint32_t)(uint64_t)flipDest(),(uint32_t)flipDestCached(),(uint32_t)video.v_rowBytes,
++                        width,height,(uint32_t)source->getPhysicalAddress(),(uint32_t)sourceStride,(uint32_t)stored);
++            }
++        }
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-@@ -387,7 +651,19 @@
+         finishTransfer(request);
+@@ -387,7 +674,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -393,7 +426,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +673,14 @@
+@@ -397,12 +696,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
