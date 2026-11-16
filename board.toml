@@ -19,7 +19,7 @@ include = ["BootProgress", "NativeAES", "NativeKeyStoreEvents", "NativeMobileDis
 
 [kernel]
 config_fragments = ["arch:configs/common.config", "soc:configs/sm8750.config", "os:configs/ipados.config"]
-patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "device:patches/xnu/series"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "device:patches/xnu/hummer-series"]
 defconfig = "hummer_defconfig"
 archives = [
   "build-corecrypto-14.py",

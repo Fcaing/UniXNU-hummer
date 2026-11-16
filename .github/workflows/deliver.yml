@@ -39,6 +39,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache IPSW inputs and feeds
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/ipsw
+            out/feeds
+          key: hummer-f2-ipsw-21H461-v1
+          restore-keys: |
+            hummer-f2-ipsw-
       - name: Host tools
         run: |
           brew install cmake ninja unifdef llvm mtools openssl@3 dtc
