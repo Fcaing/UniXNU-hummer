@@ -24,7 +24,7 @@ OUT = ROOT / 'build/pagani-gpu'
 PINS = ROOT / 'scripts/data/sm8750-gpu-inputs.json'
 # Same policy as the driver (Adreno830 scripts/build-adreno830.py); no warning is accepted.
 WARNINGS = ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator', '-Wno-reorder-init-list',
-            '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier', '-Wno-sign-conversion',
+            '-Wno-deprecated-enum-enum-conversion', '-Wno-unknown-warning-option', '-Wno-sign-conversion',
             '-Wno-shorten-64-to-32']
 HEADER_NAMES = {'native_adreno_firmware_image': 'GMU', 'native_adreno_sqe_firmware_image': 'SQE',
                 'native_adreno_aqe_firmware_image': 'AQE', 'native_adreno_zap_image': 'ZAP'}

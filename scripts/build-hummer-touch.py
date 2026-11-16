@@ -88,7 +88,7 @@ cpp_command, cpp_dir = replay(CPP_RECORD, PROBE, OUT / 'HummerTouchProbe.o')
 # own warnings must not fail the board build. Warnings are still printed.
 cpp_command += ['-Wall', '-Wextra', '-Wno-unused-parameter',
                 '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
-                '-Wno-unknown-warning-option', '-Wno-unnecessary-virtual-specifier',
+                '-Wno-unknown-warning-option', '-Wno-unknown-warning-option',
                 # The probe's diagnostics counters are volatile (read from the
                 # panic screen); ++ on a volatile is deprecated in C++20.
                 '-Wno-deprecated-volatile',
