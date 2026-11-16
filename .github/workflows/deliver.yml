@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   kernel:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 360
     defaults:
       run:
