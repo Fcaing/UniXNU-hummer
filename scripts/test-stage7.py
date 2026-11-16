@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Exercise the actual display timer lifecycle with host stubs."""
+import argparse
+import ast
+import os
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import tempfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--tree', type=Path, required=True)
+tree = parser.parse_args().tree
+builder=ast.parse((tree/'scripts/build-stage7-driver.py').read_text())
+definition=next(node for node in builder.body if isinstance(node,ast.FunctionDef) and node.name=='c_command')
+scope={};exec(compile(ast.Module(body=[definition],type_ignores=[]),'build-stage7-driver.py','exec'),scope)
+for language in (['-xc++'],['-x','c++']):
+    command=scope['c_command'](['clang',*language,'input.c','--driver-mode=g++','-std=gnu++17',
+        '-fsized-deallocation','-fno-c++-static-destructors','-fapple-kext','-mkernel','-D','KERNEL',
+        '--target=arm64-apple-ios17.0.0','-c','-o','input.o'])
+    assert command==['clang','--driver-mode=gcc','-x','c','-std=gnu11','input.c','-mkernel','-D','KERNEL',
+        '--target=arm64-apple-ios17.0.0','-c','-o','input.o'],command
+display = (tree / 'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp').read_text()
+def cut(start, end):
+    return display[display.index(start):display.index(end, display.index(start))]
+timer = (cut('    IOTimerEventSource *vsyncTimer', '    // Page flips') +
+         cut('    bool vsyncWanted()', '    // Dense sampling') +
+         cut('    void vsyncTick()', '    // A panel found'))
+refresh = display[display.index('    bool isTimingEnabled('):display.index('    // A swap the client')]
+board = (tree / 'drivers/Stage7Probe/Stage7Probe.cpp').read_text()
+observed = board[board.index('volatile uint64_t native_gop_vsync[3]'):board.index('void native_legacy_client_enter')]
+cpp = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include "NativeDisplayTiming.h"
+#include "NativeDpu.h"
+#include "../BootProgress/PeripheralStatus.h"
+void boot_progress_display_event(unsigned){}
+struct OSObject {};
+using IOReturn=int;
+constexpr int kIOReturnSuccess=0;
+static uint64_t now=1000000,notifications=0;
+static unsigned rate=60,locked=1;
+static bool addFails=false;
+static int liveTimers=0;
+static uint64_t mach_absolute_time(){return now;}
+static uint64_t mach_continuous_time(){return now+17;}
+uint32_t native_dpu_read(uint32_t){assert(false);return 0;}
+static void pagani_display_vsync(uint64_t,uint64_t){}
+static void absolutetime_to_nanoseconds(uint64_t ticks,uint64_t *ns){*ns=ticks*10;}
+static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *ticks){*ticks=ns/10;}
+static bool PE_parse_boot_argn(const char *name,void *value,unsigned size){
+    assert(size==4);*static_cast<unsigned *>(value)=(!strcmp(name,"sheng-vsync") || !strcmp(name,"pagani-vsync"))?rate:locked;return true;
+}
+static void progress(const char *,unsigned){}
+''' + observed + r'''
+static void native_legacy_vsync_notify(void *,uint64_t stamp,uint64_t continuous,uint64_t interval){
+    assert(stamp<=now && continuous==stamp+17 && interval==(rate==120?833333u:1666666u));++notifications;
+}
+struct IOTimerEventSource {
+    uint64_t deadline=0;unsigned arms=0;bool cancelled=false;
+    static IOTimerEventSource *timerEventSource(OSObject *,void (*)(OSObject *,IOTimerEventSource *)){
+        ++liveTimers;return new IOTimerEventSource;
+    }
+    void wakeAtTime(uint64_t time){deadline=time;++arms;}
+    void cancelTimeout(){cancelled=true;}
+    void release(){--liveTimers;delete this;}
+};
+struct IOWorkLoop {
+    int addEventSource(IOTimerEventSource *){return addFails?1:0;}
+    void removeEventSource(IOTimerEventSource *timer){assert(timer->cancelled);}
+    void runAction(IOReturn (*action)(OSObject *,void *,void *,void *,void *),OSObject *owner){action(owner,nullptr,nullptr,nullptr,nullptr);}
+};
+#define OSSafeReleaseNULL(p) do {if(p)(p)->release();(p)=nullptr;} while(0)
+struct IOMobileFramebufferLegacy:OSObject {
+    virtual bool isTimingEnabled()=0;
+    virtual bool getRefreshAttributes(uint64_t *words,bool){if(!words)return false;for(unsigned i=0;i<6;++i)words[i]=100+i;return true;}
+};
+class NativeLegacyDisplay:public IOMobileFramebufferLegacy {
+public:
+    unsigned char storage[5600]={};
+    bool primary=true,bootMapping=true;
+    bool retryKick=false;
+    bool teEdge(unsigned,uint64_t *,uint16_t *){assert(false);return false;}
+    void publishTe(){}
+    void kickSwapQueue(){assert(false);}
+    IOWorkLoop loop;
+    IOWorkLoop *getWorkLoop(){return &loop;}
+''' + timer + refresh + r'''
+    void clients(bool present){const void *head=present?this:nullptr;memcpy(reinterpret_cast<char *>(this)+5592,&head,sizeof head);}
+};
+int main(){
+    NativeLegacyDisplay display;
+    assert(display.isTimingEnabled());
+    display.primary=false;assert(!display.isTimingEnabled());display.primary=true;
+    display.bootMapping=false;assert(!display.isTimingEnabled());display.bootMapping=true;
+    display.displayOn=false;assert(!display.isTimingEnabled());display.displayOn=true;
+    addFails=true;display.startVsync();assert(!display.vsyncTimer && !liveTimers);addFails=false;
+    rate=241;display.startVsync();assert(!display.vsyncTimer);rate=60;
+    display.startVsync();assert(display.vsyncTimer && !display.vsyncArmed && liveTimers==1);
+    display.clients(true);display.armVsync();assert(display.vsyncArmed);
+    auto timer=display.vsyncTimer;assert(timer->arms==1 && timer->deadline==now+display.vsyncInterval);
+    display.armVsync();assert(timer->arms==1);
+    now=timer->deadline;display.vsyncTick();assert(notifications==1 && timer->deadline==now+display.vsyncInterval);
+    now+=display.vsyncInterval*4;display.vsyncTick();assert(notifications==2 && timer->deadline==now+display.vsyncInterval);
+    display.clients(false);display.vsyncTick();assert(!display.vsyncArmed && notifications==2);
+    display.clients(true);display.displayOn=false;display.armVsync();assert(!display.vsyncArmed);
+    display.vsyncTick();assert(notifications==2);
+    display.displayOn=true;display.armVsync();assert(display.vsyncArmed && timer->deadline==now+display.vsyncInterval);
+    uint64_t words[6]={};assert(display.getRefreshAttributes(words,false));
+    assert(words[0]==(1ull<<32)/60 && words[2]==words[0] && words[3]==words[1] && words[4]==104);
+    assert(!display.getRefreshAttributes(nullptr,false));
+    display.stopVsync();assert(!display.vsyncTimer && !liveTimers);display.stopVsync();
+    rate=120;display.startVsync();assert(display.vsyncTimer && display.vsyncArmed);
+    uint64_t expected=0;nanoseconds_to_absolutetime(1000000000ull/120,&expected);
+    assert(display.vsyncInterval==expected && display.vsyncTimer->deadline==now+expected);
+    assert(display.getRefreshAttributes(words,false));
+    assert(words[0]==(1ull<<32)/120 && words[2]==words[0] && words[3]==words[1]);
+    now=display.vsyncTimer->deadline;display.vsyncTick();assert(notifications==3);
+    assert(native_gop_vsync[0]==120 && native_gop_vsync[1]==notifications && native_gop_vsync[2]==1);
+    display.stopVsync();assert(!display.vsyncTimer && !liveTimers);
+}
+'''
+with tempfile.TemporaryDirectory(prefix='stage7-check-') as temporary:
+    folder = Path(temporary)
+    for language, compiler, standard in [('c', 'cc', 'c11'), ('c++', 'c++', 'c++17')]:
+        binary = folder / ('request-state-' + language)
+        subprocess.run([compiler, '-x', language, '-std=' + standard, '-Wall', '-Wextra', '-Werror',
+                        '-fsanitize=address,undefined', str(tree / 'drivers/NativeMobileDisplay/Test/request-state.c'),
+                        '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+    console = tree / 'drivers/BootProgress'
+    source = folder / 'console-runtime.c'
+    source.write_text((console / 'Test/console.c').read_text().split('static void panic_for_test', 1)[0])
+    obj = source.with_suffix('.o')
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-O2', '-ftrivial-auto-var-init=zero', '-ffreestanding', '-fno-builtin',
+                    '-fno-stack-protector', '-fno-jump-tables', '-I', str(console / 'Test'),
+                    '-I', str(tree / 'drivers/PaganiDarwinBoot/DarwinBootPkg/Driver'),
+                    '-c', str(source), '-o', str(obj)], check=True)
+    undefined = subprocess.check_output(['nm', '-u', str(obj)], text=True)
+    assert not re.search(r'\b_*(?:memset|memcpy|bzero|stack_chk_fail)\b', undefined), undefined
+    for name, text, compiler, standard in [('refresh.cpp', cpp, 'c++', 'c++17')]:
+        source = folder / name
+        source.write_text(text)
+        binary = source.with_suffix('')
+        subprocess.run([compiler, '-std=' + standard, '-Wall', '-Wextra', '-Werror',
+                        '-fsanitize=address,undefined', '-I', str(tree/'drivers/NativeMobileDisplay'), str(source), '-o', str(binary)], check=True)
+        result = subprocess.check_output([str(binary)], text=True)
+        if name == 'compat.c':
+            rules = runpy.run_path(str(Path(__file__).with_name('prepare-ram-data.py')))['COMPAT_FIXUPS']
+            expected = [f'{Path(path).name} {offset:x} {original}' for _, path, offset, original in rules]
+            assert result.splitlines() == expected, 'Build-time byte checks must match all kernel rules'
+print('PASS: pixel copy/fill and preserved bands, console runtime-helper boundary, C language selection, logical timing state, display timer lifetime and fixed refresh cadence')

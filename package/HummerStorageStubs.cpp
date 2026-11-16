@@ -1,0 +1,144 @@
+// Diagnostic link stubs for the NativeUfs probe stage (native-ufs-probe=2).
+//
+// Why these exist at all: NativeUfs.cpp is a single translation unit that also
+// derives NativeUfsBlock from IOBlockStorageDevice, and the references below
+// come from that class.  XNU 10063 ships no iokit/storage tree at all, so
+// IOBlockStorageDevice only exists inside the prelinked
+// com.apple.iokit.IOStorageFamily kext - it is not part of our kernel link.
+// The same unit also references VerifiedRoot (com.apple root verification) and
+// an optional boot-progress observer, neither of which we build yet.
+//
+// The IOBlockStorageDevice base methods are NOT listed here by hand: the vtable
+// of NativeUfsBlock needs every non-overridden virtual of the base class, i.e.
+// a list that follows whatever the storage-abi headers of the day declare.
+// scripts/build-hummer-storage-stubs.py reads the object's real undefined
+// symbols and generates a thunk for each one, so this stays correct by
+// construction.  This file only carries the things that cannot be a thunk:
+// the vtable storage, the VerifiedRoot data, and the shared refusal function.
+//
+// Design rules:
+//
+//   - Nothing is exported.  These definitions exist to satisfy references made
+//     by our own dead code (nothing in the probe path constructs
+//     NativeUfsBlock).  Prelink binds every kext's undefined symbols against
+//     the kernel's symbol table, so an exported stub here would let a real
+//     storage kext bind its call to our panic instead of the IOStorageFamily
+//     implementation.  Everything is private extern / hidden.
+//
+//   - Every named object is explicitly `extern` as well as `const`.  At
+//     namespace scope C++ gives a const object internal linkage, which would
+//     make the definition invisible to NativeUfs.o and leave the link broken.
+//
+//   - Nothing pretends to succeed.  Every callable path prints and panics.  The
+//     VerifiedRoot data is empty by construction (policy count 0), so
+//     NativeUfsBlock::configureVerification() takes its "policy count invalid"
+//     soft-failure path and the root stays closed rather than half-open.
+//
+//   - boot_progress_poll is the optional passive observer NativeUfs declares
+//     weak, i.e. a no-op is the documented behaviour when it is absent.
+//
+// When the root path is actually brought up, these must be replaced by a
+// deliberate binding to the real IOStorageFamily class in the kernelcache (the
+// same technique build-hummer-platform-power.py uses for ApplePMGR) and by the
+// real VerifiedRoot archive - not by loosening this file.
+
+#pragma GCC visibility push(hidden)
+
+// Weak on purpose: when the board also links the real VerifiedRoot bundle (the
+// macOS CI builds libVerifiedRootProbe.a) or another storage archive, the strong
+// definitions must win instead of colliding here. On a display-only Linux build
+// these are the only definitions, so the refusal behaviour below still applies.
+#define HUMMER_STUB_WEAK __attribute__((weak))
+
+#include <stddef.h>
+#include <stdint.h>
+
+extern "C" {
+extern int kprintf(const char *format, ...);
+extern void panic(const char *format, ...) __attribute__((noreturn));
+
+// Tail-call target of every generated IOBlockStorageDevice thunk.  Each thunk
+// passes its own mangled symbol, so the panic names the exact base method that
+// reached a stub instead of only its consequence.
+void hummer_storage_unavailable(const char *symbol)
+{
+	kprintf("HUMMER STUB: %s reached; only the prelinked IOStorageFamily kext "
+		"carries this class", symbol);
+	panic("HUMMER STUB: %s", symbol);
+}
+
+// ---- IOBlockStorageDevice vtable: bound, not owned --------------------------------
+//
+// v57: the real class dispatch table (and its constructor, destructor and
+// metaclass) lives in the prelinked IOStorageFamily kext.  build-hummer-storage-
+// stubs.py emits original-bindings.S with .set directives that point these
+// symbols at those addresses, so a virtual dispatch goes to the shipped code
+// instead of faulting on a zero table.  Nothing is defined here any more: a
+// second definition would collide with the assembly binding.
+
+// ---- VerifiedRoot: present, but refuses to authenticate anything ----
+struct hummer_vr_crypto_stub {
+	int (*sha256)(const void *, size_t, uint8_t[32]);
+	int (*rsa3072_sha256)(const uint8_t[395], const uint8_t[32], const uint8_t[384]);
+};
+struct hummer_vr_view_stub;
+
+extern const uint64_t verified_root_policy_count;
+HUMMER_STUB_WEAK const uint64_t verified_root_policy_count = 0;
+extern const unsigned char verified_root_policies[4096];
+HUMMER_STUB_WEAK const unsigned char verified_root_policies[4096] = {0};
+extern const unsigned char verified_root_key[395];
+HUMMER_STUB_WEAK const unsigned char verified_root_key[395] = {0};
+extern const struct hummer_vr_crypto_stub vr_xnu_crypto;
+HUMMER_STUB_WEAK const struct hummer_vr_crypto_stub vr_xnu_crypto = {0, 0};
+
+extern int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
+		   const struct hummer_vr_crypto_stub *, struct hummer_vr_view_stub *);
+HUMMER_STUB_WEAK int vr_open(const uint8_t *, size_t, const uint8_t[395], uint64_t,
+	    const struct hummer_vr_crypto_stub *, struct hummer_vr_view_stub *)
+{
+	kprintf("HUMMER STUB: vr_open reached; the owner root is not built into this probe image\n");
+	panic("HUMMER STUB: vr_open");
+}
+
+extern int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, size_t,
+			   const struct hummer_vr_crypto_stub *);
+HUMMER_STUB_WEAK int vr_verify_block(const struct hummer_vr_view_stub *, uint64_t, const void *, size_t,
+		    const struct hummer_vr_crypto_stub *)
+{
+	kprintf("HUMMER STUB: vr_verify_block reached; "
+		"the owner root is not built into this probe image\n");
+	panic("HUMMER STUB: vr_verify_block");
+}
+
+// NativeUfs declares this weak: absent in ordinary builds, a no-op by contract.
+// BootProgress (kits) provides the real one, so keep this definition weak: a
+// strong stub here collides with libBootProgress.a at link time.
+__attribute__((weak)) void boot_progress_poll(void)
+{
+}
+}
+
+
+// v65: owner-root bring-up. bsd_init's auth check (patched by the engine's
+// offline-owner-root-binding-audit) keeps the root only when the storage driver
+// certifies the device it was mounted from. The real implementation lives in
+// kits/VerifiedRoot together with a signed policy bundle, which this board does
+// not build yet, so the answer is a constant here. That is the same bring-up
+// shortcut as the policy bypass in the UFS driver: remove both together.
+//
+// dev_t is 32-bit on arm64, so the int parameter is ABI-compatible with the
+// kernel's "extern int native_verified_block_root_authorized(dev_t)".
+extern "C" HUMMER_STUB_WEAK int native_verified_block_root_authorized(int device)
+{
+	(void)device;
+	return 1;
+}
+
+// Called from the verified-root probe patch when XNU_VERIFIED_ROOT_PROBE=1.
+extern "C" HUMMER_STUB_WEAK void native_verified_root_probe(void)
+{
+	kprintf("hummer: verified root probe (bring-up, no policy bundle)\n");
+}
+
+#pragma GCC visibility pop
