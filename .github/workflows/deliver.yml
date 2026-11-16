@@ -1,0 +1,108 @@
+name: hummer format-2 kernel
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: hummer-f2-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  kernel:
+    runs-on: macos-15
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: false
+          persist-credentials: false
+
+      - name: Read the engine pin
+        id: pin
+        run: |
+          revision=$(cat device/upstream.rev)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ steps.pin.outputs.revision }}
+          path: main
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Host tools
+        run: |
+          brew install cmake ninja unifdef llvm mtools openssl@3 dtc
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+
+      - name: Configure, fetch and assemble the tree
+        working-directory: main
+        run: |
+          ./unixnu defconfig hummer_defconfig -D ../device
+          ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          ./unixnu tree
+          OUTPUT="$PWD/out/hummer/ipados-17.7.11-21H461/hummer"
+          mkdir -p "$OUTPUT/logs"
+          echo "UNIXNU_OUTDIR=$OUTPUT" >> "$GITHUB_ENV"
+          echo "UNIXNU_TREE=$OUTPUT/tree" >> "$GITHUB_ENV"
+
+      - name: Fetch the iPadOS 17.7.11 inputs
+        working-directory: main
+        run: |
+          ./unixnu ipsw fetch AppleLogo KernelCache OS Cryptex1,SystemOS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee "$UNIXNU_OUTDIR/logs/ipsw.log"
+          python3 "$UNIXNU_TREE/scripts/audit-stage7-display.py" out/ipsw/21H461/kernelcache.decompressed
+
+      - name: Policies, original trust and volatile Data
+        working-directory: main
+        run: |
+          openssl_prefix="$(brew --prefix openssl@3)"
+          python3 ../device/scripts/prepare-ufs-policies.py --tree "$UNIXNU_TREE" \
+            --inputs out/ipsw/21H461 --openssl-prefix "$openssl_prefix" 2>&1 | tee "$UNIXNU_OUTDIR/logs/policies.log"
+          python3 ../device/scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" \
+            --inputs out/ipsw/21H461 --output "$UNIXNU_OUTDIR/original-static-system.bundle" 2>&1 | tee "$UNIXNU_OUTDIR/logs/trust.log"
+          sudo "$(command -v python3)" ../device/scripts/prepare-ram-data.py --tree "$UNIXNU_TREE" \
+            --source out/ipsw/21H461/044-76040-038.dmg --systemos out/ipsw/21H461/044-76034-038.dmg \
+            --output "$UNIXNU_OUTDIR/ram-data" --config "$UNIXNU_OUTDIR/.config" 2>&1 | tee "$UNIXNU_OUTDIR/logs/ram-data.log"
+
+      - name: Build XNU
+        working-directory: main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu kernel -j 3 2>&1 | tee "$UNIXNU_OUTDIR/logs/kernel.log"
+
+      - name: Collect the artefacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          OUT="main/out/hummer/ipados-17.7.11-21H461/hummer"
+          cp -a "$OUT/logs" artifacts/logs || true
+          for f in kernel.macho kernel.macho.adt kernel.macho.trustcache scratch-data.img; do
+            find "$OUT" -name "$f" -maxdepth 3 -exec cp -a {} "artifacts/$f" \; 2>/dev/null || true
+          done
+          ls -l artifacts
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-f2-kernel
+          path: artifacts
+
+      - name: Publish
+        if: success()
+        run: |
+          gh release view ci-latest -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create ci-latest -R "$GITHUB_REPOSITORY" --title "hummer format-2 kernel" --notes "built from $GITHUB_SHA"
+          gh release upload ci-latest artifacts/* -R "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
