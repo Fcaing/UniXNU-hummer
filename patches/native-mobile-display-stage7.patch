@@ -333,7 +333,16 @@
                  bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                  native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
              }
-@@ -211,7 +469,7 @@
+@@ -207,11 +465,15 @@
+             native_legacy_swap_stage(1);
+             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
+         }
+-        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
++        // v-fb-10: the surface read was 33 ms of the 67 ms swap (425 MB/s, uncached reads of the
++        // whole 14 MB). Map it copyback-cached, then read it with memcpy: the pixels come from
++        // ordinary DRAM and nothing else writes them, so a cached read cannot go stale here.
++        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
++        if(!source || !source->getVirtualAddress())source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
          }
@@ -342,7 +351,7 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -229,7 +487,34 @@
+@@ -229,7 +491,34 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
@@ -377,7 +386,7 @@
          uint64_t stored=UINT64_MAX;
          {
              // Store only what changed since the previous frame (the scanout memory is slow device memory).
-@@ -241,14 +526,14 @@
+@@ -241,14 +530,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -394,7 +403,7 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,7 +541,34 @@
+@@ -256,7 +545,34 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -430,7 +439,7 @@
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
          finishTransfer(request);
-@@ -387,7 +699,19 @@
+@@ -387,7 +703,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -451,7 +460,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +721,14 @@
+@@ -397,12 +725,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
@@ -467,3 +476,20 @@
      LEAF(211)
      LEAF(245)
      LEAF(246)
+--- a/NativeLegacyRequest.h
++++ b/NativeLegacyRequest.h
+@@ -121,6 +121,14 @@
+     // Source and destination are both BGRA8888 little-endian words, so the pixels move unchanged. Use aligned 64-bit
+     // device stores (four per iteration) instead of byte-wise pixel assembly: the stores into device memory dominate.
+     // The destination base and stride are 8-byte aligned in practice (checked here); otherwise 32-bit stores remain.
++    // v-fb-10: with a cached source and a cached destination a straight memcpy per row is the
++    // fastest form (14 MB in well under a millisecond); the word loops below stay for the rest.
++    if(!(dst&15) && !(destinationStride&15) && !(src&15) && !(sourceStride&15) && !(width&3)) {
++        size_t rowBytes=(size_t)width*4;
++        for (uint32_t row=0;row<height;++row)
++            __builtin_memcpy((void *)(dst+row*destinationStride),(const void *)(src+row*sourceStride),rowBytes);
++        return 1;
++    }
+     int wide=!(dst&7) && !(destinationStride&7);
+     for (uint32_t row=0;row<height;++row) {
+         volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
