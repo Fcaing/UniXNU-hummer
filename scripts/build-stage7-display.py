@@ -237,9 +237,15 @@ dpu=display_object('DpuProbe')
 require(not any(s['name']=='__mod_init_func' for g in macho(dpu.read_bytes())['segments'] for s in g['sections']),
         'DpuProbe has no static initializer')
 objects+=[presenter_late,dpu]
-print(run(['python3',ROOT/'scripts/build-pagani-peripherals.py','--kernelcache',args.kernelcache],text=True),end='')
-peripherals=ROOT/'build/pagani-peripherals'
-objects += [peripherals/name for name in ('PaganiInput.late.o','PaganiPanel.late.o','PaganiS3910.o','PaganiGeniSpi.o','peripheral-bindings.o')]
+# The Pagani panel/input peripherals belong to the 13T board. Hummer drives its own
+# panel through the legacy presenter and its touch controller from package/, so the
+# peripheral pass is only run when those drivers are actually present.
+if (ROOT/'drivers/PaganiInput').exists():
+    print(run(['python3',ROOT/'scripts/build-pagani-peripherals.py','--kernelcache',args.kernelcache],text=True),end='')
+    peripherals=ROOT/'build/pagani-peripherals'
+    objects += [peripherals/name for name in ('PaganiInput.late.o','PaganiPanel.late.o','PaganiS3910.o','PaganiGeniSpi.o','peripheral-bindings.o')]
+else:
+    print('stage7-display: Pagani peripherals absent on this board, skipped',end='\n')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,*objects])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
