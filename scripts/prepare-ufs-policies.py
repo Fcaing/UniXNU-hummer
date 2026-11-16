@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import plistlib
+import platform
 import runpy
 import subprocess
 import uuid
@@ -18,7 +19,7 @@ class View(ctypes.Structure):
 
 
 def prepare(tree, inputs, openssl):
-    kit = tree / 'kits/VerifiedRoot'
+    kit = tree / 'kits/PaganiVerifiedRoot'
     host = tree / 'build/verified-root-host'
     # Reuse the real parser/signature/block tests and their private local build key.
     subprocess.run(['python3', kit / 'tests/check.py', '--output', host,
@@ -43,7 +44,11 @@ def prepare(tree, inputs, openssl):
             if hashlib.file_digest(stream, 'sha256').hexdigest() != source_digest:
                 raise ValueError(f'{name}: IPSW input hash mismatch')
         device = None
-        if name == 'os':
+        if name == 'os' and platform.system() == 'Linux':
+            raw = source.with_suffix('.raw')
+            if raw.stat().st_size != size:
+                raise ValueError('os: decoded raw image has the wrong size')
+        elif name == 'os':
             attached = plistlib.loads(subprocess.check_output([
                 'hdiutil', 'attach', '-nomount', '-readonly', '-noautofsck', '-plist', source]))
             device, = [e['dev-entry'] for e in attached['system-entities']
