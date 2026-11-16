@@ -3,3 +3,7 @@ zzzz-early-boot-progress.patch
 zzzzz-root-panic-progress.patch
 zzzzzz-vm-bootstrap-progress.patch
 zzzzzzz-early-framebuffer-page-tables.patch
+zzz-boot-progress.patch
+native-stage7-userspace-compat.patch
+zzzzzzzz-usb-cdc-console.patch
+zzzzzzzz-usb-cdc-worker.patch
