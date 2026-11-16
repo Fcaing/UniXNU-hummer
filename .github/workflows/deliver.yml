@@ -9,10 +9,6 @@ concurrency:
 jobs:
   kernel:
     runs-on: macos-15
-    # Apple clang dropped -Wno-unnecessary-virtual-specifier while some kit scripts still
-    # pass it together with -Werror; CCC_OVERRIDE_OPTIONS drops just that one diagnostic.
-    env:
-      CCC_OVERRIDE_OPTIONS: '# +-Wno-unnecessary-virtual-specifier'
     timeout-minutes: 360
     defaults:
       run:
