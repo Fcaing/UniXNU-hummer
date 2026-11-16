@@ -342,17 +342,42 @@
              bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
              source->getLength(),sourceStride,width,height)) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -229,7 +487,9 @@
+@@ -229,7 +487,34 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-+        if(dgOn<0){unsigned v=0;PE_parse_boot_argn("fb_diag",&v,sizeof v);dgOn=(v==1);}
++        if(dgOn<0){unsigned v=0;PE_parse_boot_argn("fb_diag",&v,sizeof v);dgOn=(int)v;}
++        if(dgOn==2){
++            // Where do the 67 ms go? Time the source read, the store into the mapping and the
++            // clean on their own.
++            static void *bench=nullptr;
++            uint64_t need=(uint64_t)width*height*4;
++            if(!bench)bench=IOMallocAligned((vm_size_t)need,16384);
++            if(bench&&need<=(64ull<<20)) {
++                uint64_t t0,t1,t2,t3,t4;
++                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0));
++                __builtin_memcpy(bench,reinterpret_cast<const void *>(source->getVirtualAddress()),(size_t)need);
++                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t1));
++                __builtin_memcpy((void *)flipDest(),bench,(size_t)need);
++                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t2));
++                for(uintptr_t line=(uintptr_t)flipDest()&~(uintptr_t)63;line<(uintptr_t)flipDest()+need;line+=64)
++                    __asm__ volatile("dc civac, %0"::"r"(line):"memory");
++                __asm__ volatile("dsb sy":::"memory");
++                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t3));
++                __builtin_memset((void *)flipDest(),0,(size_t)need);
++                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t4));
++                panic("FBBM read %u store %u clean %u memset %u us | need %u cached %u",
++                    (uint32_t)((t1-t0)/24),(uint32_t)((t2-t1)/24),(uint32_t)((t3-t2)/24),(uint32_t)((t4-t3)/24),
++                    (uint32_t)need,(uint32_t)flipDestCached());
++            }
++            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnSuccess,request,length);return;
++        }
          uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
 +        if(dgOn && !dgStart)dgStart=copyStart;
          uint64_t stored=UINT64_MAX;
          {
              // Store only what changed since the previous frame (the scanout memory is slow device memory).
-@@ -241,14 +501,14 @@
+@@ -241,14 +526,14 @@
              if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
              if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
              if(!diffOff && shadow && shadowBytes>=need)
@@ -369,7 +394,7 @@
                  bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                  source->getLength(),sourceStride,width,height)) {
                  OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
-@@ -256,7 +516,34 @@
+@@ -256,7 +541,34 @@
              stored=length;
          }
          __asm__ volatile("dsb sy" ::: "memory");
@@ -405,7 +430,7 @@
          OSSafeReleaseNULL(source);transferred=true;
          native_legacy_transfer_observed(kIOReturnSuccess,request,length);
          finishTransfer(request);
-@@ -387,7 +674,19 @@
+@@ -387,7 +699,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -426,7 +451,7 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -397,12 +696,14 @@
+@@ -397,12 +721,14 @@
              valid=width==video.v_width && height==video.v_height;
              if(valid) {
                  OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
