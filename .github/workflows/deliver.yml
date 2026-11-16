@@ -97,6 +97,26 @@ jobs:
         run: |
           ./unixnu kernel -j 3 2>&1 | tee "$UNIXNU_OUTDIR/logs/kernel.log"
 
+      - name: Collect the policy artefacts
+        if: inputs.mode == 'prepare'
+        run: |
+          mkdir -p policy
+          cp -r out/hummer/ipados-17.7.11-21H461/hummer/original-static-system.bundle policy/ || true
+          cp -r out/hummer/ipados-17.7.11-21H461/hummer/ram-data policy/ || true
+          cp -r main/out/hummer/ipados-17.7.11-21H461/hummer/original-static-system.bundle policy/ || true
+          cp -r main/out/hummer/ipados-17.7.11-21H461/hummer/ram-data policy/ || true
+          cp -r main/out/hummer/ipados-17.7.11-21H461/hummer/tree/build/verified-root-os-xnu-bundle policy/ || true
+          cp -r main/out/hummer/ipados-17.7.11-21H461/hummer/tree/build/verified-root-host policy/ || true
+          ls -R policy | head -40
+
+      - name: Upload the policy artefacts
+        if: inputs.mode == 'prepare'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-f2-policy
+          path: policy
+          if-no-files-found: warn
+
       - name: Collect the artefacts
         if: always()
         run: |
