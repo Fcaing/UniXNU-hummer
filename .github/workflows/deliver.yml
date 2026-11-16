@@ -1,6 +1,11 @@
 name: hummer format-2 kernel
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'prepare (fetch IPSW inputs only, warms the cache) or full (build the kernel)'
+        required: false
+        default: 'full'
 permissions:
   contents: write
 concurrency:
@@ -72,6 +77,7 @@ jobs:
           python3 "$UNIXNU_TREE/scripts/audit-stage7-display.py" out/ipsw/21H461/kernelcache.decompressed
 
       - name: Policies, original trust and volatile Data
+        if: inputs.mode != 'prepare'
         working-directory: main
         run: |
           openssl_prefix="$(brew --prefix openssl@3)"
@@ -84,6 +90,7 @@ jobs:
             --output "$UNIXNU_OUTDIR/ram-data" --config "$UNIXNU_OUTDIR/.config" 2>&1 | tee "$UNIXNU_OUTDIR/logs/ram-data.log"
 
       - name: Build XNU
+        if: inputs.mode != 'prepare'
         working-directory: main
         env:
           GITHUB_TOKEN: ${{ github.token }}
