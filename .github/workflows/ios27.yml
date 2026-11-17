@@ -9,7 +9,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 350
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
