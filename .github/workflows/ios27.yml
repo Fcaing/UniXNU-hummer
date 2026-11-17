@@ -1,0 +1,76 @@
+name: hummer ios27
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: hummer-ios27-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+          persist-credentials: false
+      - name: Read the engine pin
+        id: pin
+        run: |
+          revision=$(cat device/upstream.rev)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ steps.pin.outputs.revision }}
+          path: main
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install host tools
+        run: |
+          brew install cmake ninja unifdef llvm mtools openssl@3 dtc lzfse
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+      - name: Apply the device patches to the engine and the driver submodule
+        run: |
+          git -C main apply -v "$GITHUB_WORKSPACE/device/ci/engine-27.patch"
+          git -C device/modules/Pagani apply -v "$GITHUB_WORKSPACE/device/ci/pagani-27.patch"
+      - name: Build the kernel collection and the root volume
+        working-directory: main
+        env:
+          OS: ios-27.0.1-24A446-iphone17-1
+        run: |
+          set -euo pipefail
+          ./unixnu defconfig hummer_defconfig -D ../device --os "$OS"
+          ./unixnu fetch -D ../device --os "$OS" xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          ./unixnu tree -D ../device --os "$OS"
+          ./unixnu kernel -D ../device --os "$OS" -j 3
+          ./unixnu prelink -D ../device --os "$OS"
+          ./unixnu build userdata -D ../device --os "$OS"
+      - name: Collect the artefacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          OUT="main/out/hummer/ios-27.0.1-24A446-iphone17-1/hummer"
+          cp -a "$OUT/logs" artifacts/logs || true
+          cp -a "$OUT/kernel/kernel.macho" artifacts/ 2>/dev/null || true
+          cp -a "$OUT/kernel/kernel.json" artifacts/ 2>/dev/null || true
+          cp -a "$OUT/userdata/userdata-root.img" artifacts/ 2>/dev/null || true
+          cp -a "$OUT/userdata/userdata-root.json" artifacts/ 2>/dev/null || true
+          ls -l artifacts
+      - name: Publish
+        if: success()
+        run: |
+          gh release view ci-27 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create ci-27 -R "$GITHUB_REPOSITORY" --title "hummer ios27" --notes "built from $GITHUB_SHA"
+          gh release upload ci-27 artifacts/* -R "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

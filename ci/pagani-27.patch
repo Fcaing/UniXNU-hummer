@@ -1,0 +1,3264 @@
+diff --git a/drivers/BootProgress/BootProgress.c b/drivers/BootProgress/BootProgress.c
+index 9d5e813..a51469a 100644
+--- a/drivers/BootProgress/BootProgress.c
++++ b/drivers/BootProgress/BootProgress.c
+@@ -72,6 +72,7 @@ static char stages[HISTORY][STAGE_BYTES], root_stage[STAGE_BYTES], root_detail[1
+ static char display_stage[STAGE_BYTES], exit_stage[STAGE_BYTES];
+ static uint64_t display_value;
+ static unsigned stage_count, panic_state, panic_limit, panic_clipped;
++static uint64_t map_trace;   /* hummer: which early_boot_progress_map exit was taken */
+ // pagani-overlay=0: no diagnostic text on the screen (the status band, the GPU, FPS, CPU and peripheral rows, the boot text); the
+ // ramoops log keeps all of it, the boot logo and a panic screen still show. Default 1. The text covered the top-left corner of the
+ // iOS UI (back buttons, the status bar) on the phone layout (the user, 2026-10-30).
+@@ -1097,28 +1098,30 @@ void early_boot_progress_init(boot_args *args)
+ int early_boot_progress_map(uint64_t *l1, uintptr_t free_page, uintptr_t end)
+ {
+     const uint64_t block = 1ULL << 21, table_mask = 0x0000fffffffff000ULL;
++    map_trace = 1;
+     if (!framebuffer) return 1;
+     uint64_t first = framebuffer_pa & ~(block - 1);
+     uint64_t limit = (framebuffer_pa + (uint64_t)stride * 4 * height + block - 1) & ~(block - 1);
+     // The kernel selects a full or half L1 table; never alias addresses beyond it.
+-    if (limit > (1ULL << (64 - T0SZ_BOOT)) || (free_page & 4095) || (end & 4095)) return 0;
++    if (limit > (1ULL << (64 - T0SZ_BOOT)) || (free_page & 4095) || (end & 4095)) { map_trace = 0x10 | (limit >> 28); return 0; }
+     for (uint64_t pa = first; pa < limit; pa += block) {
+         uint64_t *slot = &l1[(pa >> 30) & 511];
+         if (*slot == 0) {
+-            if (free_page > end || end - free_page < 4096) return 0;
++            if (free_page > end || end - free_page < 4096) { map_trace = 0x20; return 0; }
+             volatile uint64_t *page = (volatile uint64_t *)free_page;
+             for (unsigned i = 0; i < 512; i++) page[i] = 0;
+             *slot = free_page | 3;
+             free_page += 4096;
+         }
+-        if ((*slot & 3) != 3) return 0;
++        if ((*slot & 3) != 3) { map_trace = 0x30; return 0; }
+         uint64_t *l2 = (uint64_t *)(uintptr_t)(*slot & table_mask);
+         // Attr1 = normal non-cacheable in XNU's MAIR, outer-shareable, AF, EL1 RW, XN.
+         uint64_t mapping = pa | (1ULL << 54) | (1ULL << 53) | 0x605;
+-        if (l2[(pa >> 21) & 511] != 0 && l2[(pa >> 21) & 511] != mapping) return 0;
++        if (l2[(pa >> 21) & 511] != 0 && l2[(pa >> 21) & 511] != mapping) { map_trace = 0x40 | (pa >> 28); return 0; }
+         l2[(pa >> 21) & 511] = mapping;
+     }
+     barrier();
++    map_trace = 0x99;
+     early_boot_stage = 2;
+     boot_progress_stage("S2: bootstrap maps ready");
+     return 1;
+@@ -1160,6 +1163,12 @@ void early_boot_progress_fatal(boot_args *args, uint64_t esr, uint64_t elr, uint
+     early_boot_progress_init(args);
+     if (framebuffer) panic_open("OnePlus 13T / EARLY EXCEPTION");
+     value_raw("last checkpoint", stage);
++    value_raw("map trace", map_trace);
++    value_raw("fb pa", framebuffer_pa);
++    value_raw("fb stride", (uint64_t)stride * 4);
++    value_raw("fb rows", height);
++    value_raw("Video w", (uint64_t)args->Video.v_width);
++    value_raw("Video depth", (uint64_t)args->Video.v_depth);
+     value_raw("ESR_EL1", esr); value_raw("ELR_EL1", elr);
+     value_raw("FAR_EL1", far); value_raw("SPSR_EL1", spsr);
+     if (framebuffer) panic_footer("HALTED: no software reboot");
+@@ -1300,15 +1309,34 @@ void boot_progress_poll(void) {}
+ void boot_progress_user_breakpoint(void *state, unsigned esr) { (void)state; (void)esr; }
+ void boot_progress_user_abort(void *state, unsigned esr, uint64_t far) { (void)state; (void)esr; (void)far; }
+ void boot_progress_critical_exit(int pid, char *s, unsigned long n) { (void)pid; (void)s; (void)n; }
++static int bp_name_has(const char *s, const char *w)
++{
++    if (!s || !w) return 0;
++    for (; *s; s++) {
++        const char *a = s, *b = w;
++        while (*a && *b && *a == *b) { a++; b++; }
++        if (!*b) return 1;
++    }
++    return 0;
++}
++
+ void boot_progress_process_stage(int pid, const char *name, const char *stage)
+ {
+     char line[STAGE_BYTES];
++    /* Keep the early process tree and the display-side service names; drop the
++       long tail of repeated daemon execs so the ramoops ring spans the boot. */
++    if (pid > 120 && !(bp_name_has(name, "board") || bp_name_has(name, "Spring") ||
++                       bp_name_has(name, "running") || bp_name_has(name, "loginwindow")))
++        return;
+     snprintf(line, sizeof(line), "pid=%d %.20s %.36s", pid, name ? name : "?", stage ? stage : "?");
+     boot_progress_stage(line);
+ }
+ void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint64_t code)
+ {
+     char line[STAGE_BYTES];
++    if (pid > 120 && !(bp_name_has(name, "board") || bp_name_has(name, "Spring") ||
++                       bp_name_has(name, "running") || bp_name_has(name, "loginwindow")))
++        return;
+     snprintf(line, sizeof(line), "exit pid=%d %.16s status=%x ns=%u code=%llx", pid,
+              name ? name : "?", (unsigned)status, ns, (unsigned long long)code);
+     uint64_t flags = irq_save();
+diff --git a/drivers/NativeUfs/NativeUfs.cpp b/drivers/NativeUfs/NativeUfs.cpp
+index 7ba4553..e04bafb 100644
+--- a/drivers/NativeUfs/NativeUfs.cpp
++++ b/drivers/NativeUfs/NativeUfs.cpp
+@@ -10,6 +10,11 @@
+ #include <libkern/crypto/sha2.h>
+ #include <vm/vm_kern.h>
+ #include <vm/vm_map.h>
++#if XNU_KERNEL_PRIVATE
++#include <mach/vm_map.h>
++#include <vm/vm_kern_xnu.h>
++#include <vm/vm_map_internal.h>
++#endif
+ #include <sys/param.h>
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+ #include "verified_root.h"
+@@ -1361,8 +1366,8 @@ bool NativeUfsBlock::configureVerification ()
+   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
+   memcpy (key, verified_root_key, VR_KEY_BYTES);
+   gRootDiagnostic.stage = "policy read-only protection";
+-  if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
+-                      VM_PROT_READ, TRUE) != KERN_SUCCESS) {
++  if (vm_protect (kernel_map, verifiedStorage, verifiedStorageBytes,
++                  TRUE, VM_PROT_READ) != KERN_SUCCESS) {
+     return false;
+   }
+   gRootDiagnostic.stage = "owner signature and hash table";
+diff --git a/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp b/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp
+index 0d1a147..301ed28 100644
+--- a/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp
++++ b/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp
+@@ -22,6 +22,13 @@
+ #include <sys/param.h>
+ #include <vm/vm_kern.h>
+ #include <vm/vm_map.h>
++#if XNU_KERNEL_PRIVATE
++// The public kernel headers keep the four-argument kmem_alloc, kma_flags_t and
++// vm_map_protect in the private VM headers.
++#include <mach/vm_map.h>
++#include <vm/vm_kern_xnu.h>
++#include <vm/vm_map_internal.h>
++#endif
+ extern "C" {
+ extern const struct vr_crypto vr_xnu_crypto;
+ extern const uint8_t verified_root_manifest[], verified_root_key[];
+@@ -403,8 +410,8 @@ bool NativeVirtioBlock::configureVerification()
+   memcpy(reinterpret_cast<void *>(verifiedStorage), manifest, manifestBytes);
+   auto *key = reinterpret_cast<uint8_t *>(verifiedStorage + tableBytes);
+   memcpy(key, verified_root_key, VR_KEY_BYTES);
+-  if (vm_map_protect(kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
+-      VM_PROT_READ, TRUE) != KERN_SUCCESS) return false;
++  if (vm_protect(kernel_map, verifiedStorage, verifiedStorageBytes,
++      TRUE, VM_PROT_READ) != KERN_SUCCESS) return false;
+   if (vr_open(reinterpret_cast<const uint8_t *>(verifiedStorage), manifestBytes,
+       key, 1, &vr_xnu_crypto, &verified) != VR_OK || verified.image_bytes != capacity * 512) return false;
+   verifiedSnapshot = static_cast<unsigned char *>(IOMalloc(transferSize));
+diff --git a/drivers/Stage7Probe/Stage7Probe.cpp b/drivers/Stage7Probe/Stage7Probe.cpp
+index a373039..9f7562a 100644
+--- a/drivers/Stage7Probe/Stage7Probe.cpp
++++ b/drivers/Stage7Probe/Stage7Probe.cpp
+@@ -12,6 +12,7 @@
+ #include <mach/kmod.h>
+ #include <kern/clock.h>
+ #include <kern/thread_call.h>
++#include <kern/task.h>
+ #include "../BootProgress/PeripheralStatus.h"
+ extern "C" kmod_info_t g_kernel_kmod_info;
+ extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
+@@ -183,14 +184,22 @@ void native_legacy_vsync_observed(unsigned event,unsigned hz) {
+     else if(event==8)progress("display TE lost",hz);
+     else if(event==9)progress("panel switched to Hz",hz);
+ }
+-void native_legacy_client_enter(task_t,uint32_t type) {progress("display client enter",type);}
+-void native_legacy_client_observed(IOReturn status,IOUserClient *) {progress("display client",status?(uint32_t)status:++clients);}
++extern int proc_name(int pid, char *name, int size);
++static uint64_t lastClientPid;
++static char lastClientName[17];
++void native_legacy_client_enter(task_t task,uint32_t type) {int pid=task_pid(task);lastClientPid=(uint64_t)(uint32_t)pid;lastClientName[0]=0;proc_name(pid,lastClientName,sizeof lastClientName);progress(lastClientName[0]?lastClientName:"client-enter",(lastClientPid<<32)|type);}
++void native_legacy_client_observed(IOReturn status,IOUserClient *) {progress(status?"client-fail":(lastClientName[0]?lastClientName:"client-observed"),status?(uint32_t)status:((lastClientPid<<32)|(uint32_t)++clients));}
+ void native_legacy_pm_observed(unsigned stage,IOReturn status,unsigned long) {if(status)progress("display PM error",((uint64_t)stage<<32)|(uint32_t)status);}
+ void native_legacy_frame_observed(unsigned,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {}
+ void native_legacy_frame_colors_observed(const uint32_t *,const uint64_t *,uint64_t) {}
+ void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *,const void *) {if(!accepted)progress("display swap rejected",reason);}
+ void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t format,uint32_t,uint64_t,uint64_t,uint64_t) {progress("surface format rejected",format);}
+-bool native_legacy_prepare_scanout(void) {return boot_progress_display_handoff()!=0;}
++bool native_legacy_prepare_scanout(void) {
++    static uint64_t scanoutPid;
++    uint64_t pid=(uint64_t)(uint32_t)task_pid(current_task());
++    if(pid!=scanoutPid) {char pn[17]={0};proc_name((int)pid,pn,sizeof pn);scanoutPid=pid;progress(pn[0]?pn:"scanout-caller",pid);}
++    return boot_progress_display_handoff()!=0;
++}
+ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t) {
+     if(status) {
+         // A failed first copy must not permanently hide the diagnostic console.
+@@ -200,7 +209,7 @@ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t) {
+         // The frame count goes to BootProgress every frame (one store; the panic screen prints it). The per-frame status line is diagnostics:
+         // only the first frame and the opted-in overlays pay for it.
+         boot_progress_display_frames(++frames);
+-        if(frames==1 || frameStatus) {progress("system frame copied",frames);boot_progress_peripheral_frame();}
++        if(frames<=2 || (frames%600)==0 || frameStatus) {progress("system frame copied",frames);boot_progress_peripheral_frame();}
+     }
+ }
+ void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t) {
+diff --git a/kits/NativePrelink/emit_prelink.py b/kits/NativePrelink/emit_prelink.py
+index 719b8b2..0c104a6 100644
+--- a/kits/NativePrelink/emit_prelink.py
++++ b/kits/NativePrelink/emit_prelink.py
+@@ -315,16 +315,62 @@ def main():
+     parser.add_argument('--output', required=True, type=Path)
+     parser.add_argument('--early-security-init', action='append', default=[], metavar='BUNDLE=ORIGINAL_VA',
+                         help='Explicit original void(void) policy initializer, called before lockdown; requires source ABI')
++    parser.add_argument('--fileset-map', type=Path, help='existing exact-input pairing for an MH_FILESET cache')
++    parser.add_argument('--fileset-reference', type=Path, help='symbol-bearing comparison kernel for fileset matching')
++    parser.add_argument('--allow-missing', action='store_true',
++                        help='MH_FILESET only: emit an experimental image with incomplete mappings')
+     args = parser.parse_args()
++    if args.output.exists():
++        raise SystemExit('Refuse to overwrite an existing candidate')
+     initializers = {}
+     for request in args.early_security_init:
+         identifier, separator, address = request.partition('=')
+         if not separator or not identifier or identifier in initializers:
+             parser.error('Use one BUNDLE=ORIGINAL_VA initializer per module')
+         initializers[identifier] = int(address, 0)
+-    image, report = emit(args.kernel.read_bytes(), args.prelinked.read_bytes(), args.root, args.slide, initializers)
+-    if args.output.exists():
+-        raise SystemExit('Refuse to overwrite an existing candidate')
++    native_data, original_data = args.kernel.read_bytes(), args.prelinked.read_bytes()
++    if len(original_data) >= 16 and struct.unpack_from('<I', original_data, 12)[0] == 12:
++        from fileset_emit import atomic_write, emit_images, validate_map, write_candidate
++        from fileset_match import match_images, MATCHER_VERSION, matcher_signature
++        reference_data = args.fileset_reference.read_bytes() if args.fileset_reference else None
++        reference_hash = hashlib.sha256(reference_data).hexdigest() if reference_data is not None else None
++        map_path = args.fileset_map or args.output.with_suffix('.map.json')
++        if args.fileset_map:
++            pairing = json.loads(map_path.read_text())
++            validate_map(original_data, native_data, pairing)
++            if pairing.get('matcher_version') != MATCHER_VERSION or pairing.get('matcher_signature') != matcher_signature():
++                parser.error('fileset map predates the current matching checks; regenerate it')
++            if reference_data is not None and pairing.get('reference_sha256') != reference_hash:
++                parser.error('fileset map does not match the supplied reference kernel')
++        else:
++            pairing = None
++            if map_path.is_file():
++                cached = json.loads(map_path.read_text())
++                try:
++                    validate_map(original_data, native_data, cached)
++                    if (cached.get('matcher_version') == MATCHER_VERSION and cached.get('matcher_signature') == matcher_signature()
++                            and cached.get('reference_sha256') == reference_hash):
++                        pairing = cached
++                except ValueError:
++                    pass
++            if pairing is None:
++                pairing = match_images(original_data, native_data, reference_data=reference_data)
++                atomic_write(map_path, (json.dumps(pairing, indent=2) + '\n').encode())
++        # An experimental image binds every unmatched function start to the
++        # panic stub, so an unknown call reports its site instead of jumping to
++        # a stale address. Data references still have no such fallback.
++        stub_symbol = '_unixnu_fileset_unmapped' if args.allow_missing else None
++        image, report = emit_images(original_data, native_data, pairing, args.root,
++                                    stub_symbol=stub_symbol, early_security_init=initializers or None)
++        report.update(kernelcache=str(args.prelinked.resolve()), native=str(args.kernel.resolve()),
++                      map=str(map_path.resolve()))
++        # Filesets use the native link address so early XNU can find their root.
++        # The old static-prelink --slide option is not applied to this format.
++        write_candidate(image, report, args.output, args.output.with_suffix('.json'), args.allow_missing)
++        return
++    if args.fileset_map or args.fileset_reference or args.allow_missing:
++        parser.error('--fileset-map, --fileset-reference and --allow-missing require an MH_FILESET input')
++    image, report = emit(native_data, original_data, args.root, args.slide, initializers)
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+     args.output.write_bytes(image)
+     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
+diff --git a/kits/NativePrelink/fileset_emit.py b/kits/NativePrelink/fileset_emit.py
+new file mode 100755
+index 0000000..fcd8b42
+--- /dev/null
++++ b/kits/NativePrelink/fileset_emit.py
+@@ -0,0 +1,798 @@
++#!/usr/bin/env python3
++"""Rebind a fileset kernelcache onto a native kernel; kexts and their addresses stay put."""
++import argparse
++from bisect import bisect_right
++from collections import Counter, defaultdict
++import hashlib
++import json
++import os
++from pathlib import Path
++import plistlib
++import struct
++import tempfile
++
++from kc_image import Image, signed
++
++LC_SEGMENT_64, LC_SYMTAB = 0x19, 0x2
++LC_DYLD_CHAINED_FIXUPS, LC_FILESET_ENTRY, LC_UNIXTHREAD = 0x80000034, 0x80000035, 0x5
++PAGE = 0x4000
++BRANCH_MASK, BRANCH_VALUE = 0x7c000000, 0x14000000
++ADRP_MASK, ADRP_VALUE = 0x9f000000, 0x90000000
++ADR_MASK, ADR_VALUE = 0x9f000000, 0x10000000
++MASK64 = (1 << 64) - 1
++MH_DYLIB_IN_CACHE = 0x80000000
++
++# Complete 23F84 Libm pools, between RETAB and the next PACIBSP. Each has
++# ADR/literal-load references and no observed incoming direct branch. Prefixes
++# alone are insufficient: a changed pool must be examined again as code/data.
++FILESET_MATH_POOLS = (
++    ('1f2003d500000000004a87c0f039fafe', 2156, '1187961410797e1dca751f916026de525922e55ef569770be507eaa817823a6d'),
++    ('0000807f0000f0420000804cdb0f493f', 1260, '5396a940a73ec06075fe8d9fb0e36b79745424d60d2968bf6d9f2a4889b47b05'),
++    ('00000000001018c00ee526157bcbdb3f', 2184, '747d8fd1b75aaa671ce2a5b32576235f4ac560f9497aa1b6dc8d7a5f8a736632'),
++    ('0000c1c00000807f1f2003d5ff799f50', 1092, '08b778c55cf3169dbc5cd4729430069adfbe5a75a422fd5233ab9f2f60174fda'),
++)
++
++# Constant pools that are not bracketed by RETAB/NOP. The SHA-256 round
++# constants sit directly before a BTI prologue, so a full-length digest is the
++# only evidence: a changed pool must be examined again as code/data.
++FILESET_DATA_POOLS = (
++    ('982f8a42', 256, '74ef7306e7452d6859b6463ce496b8df30925f69e1b2969e1f3f34bbc9c6af04'),
++)
++
++
++def inline_data_ranges(blob, pools=FILESET_MATH_POOLS):
++    result = []
++    for prefix, size, digest in pools:
++        search = 0
++        while (search := blob.find(bytes.fromhex(prefix), search)) >= 0:
++            if search >= 4 and search % 4 == 0 and blob[search - 4:search] == bytes.fromhex('ff0f5fd6') \
++                    and blob[search + size:search + size + 4] == bytes.fromhex('7f2303d5') \
++                    and hashlib.sha256(blob[search:search + size]).hexdigest() == digest:
++                result.append((search, search + size))
++            search += 4
++    for prefix, size, digest in FILESET_DATA_POOLS:
++        search = 0
++        while (search := blob.find(bytes.fromhex(prefix), search)) >= 0:
++            if search % 4 == 0 and search + size <= len(blob) and \
++                    hashlib.sha256(blob[search:search + size]).hexdigest() == digest:
++                result.append((search, search + size))
++            search += 4
++    return sorted(result)
++
++
++def prelink_info(cache):
++    segment = next(s for s in cache.segments if s['name'] == '__PRELINK_INFO')
++    raw = cache.data[segment['fileoff']:segment['fileoff'] + segment['filesize']].split(b'\0', 1)[0]
++    return segment, plistlib.loads(raw)
++
++
++def dependency_closure(cache, roots):
++    if not roots:
++        return None
++    _, metadata = prelink_info(cache)
++    entries = {e['CFBundleIdentifier']: e for e in metadata['_PrelinkInfoDictionary']}
++    closure, pending = set(), list(roots)
++    while pending:
++        identifier = pending.pop()
++        if identifier in closure:
++            continue
++        if identifier not in entries:
++            raise ValueError(f'Missing prelink dependency: {identifier}')
++        closure.add(identifier)
++        pending.extend(entries[identifier].get('OSBundleLibraries') or {})
++    return closure
++
++
++def rebase_collection(cache, base, closure=None, early_security_init=None, roots=None):
++    """Move collection metadata to XNU's link address; chain targets stay relative.
++
++    XNU start.s and arm_init.c locate the root header at VM_KERNEL_LINK_ADDRESS.
++    kmod_info.address is deliberately outside the fixup chains (pack(4), +156).
++    Other kmod pointers are handled by the collection's chained fixups.
++    """
++    delta = base - cache.base
++    data = bytearray(cache.data)
++    for at in [0] + sorted({offset for _, offset in cache.entries.values()}):
++        image = Image(cache.data, at)
++        for command, offset, length in image.commands:
++            if command == LC_SEGMENT_64:
++                address, = struct.unpack_from('<Q', data, offset + 24)
++                struct.pack_into('<Q', data, offset + 24, (address + delta) & MASK64)
++                count, = struct.unpack_from('<I', data, offset + 64)
++                for index in range(count):
++                    field = offset + 72 + 80 * index + 32
++                    address, = struct.unpack_from('<Q', data, field)
++                    struct.pack_into('<Q', data, field, (address + delta) & MASK64)
++            elif command == LC_FILESET_ENTRY:
++                address, = struct.unpack_from('<Q', data, offset + 8)
++                struct.pack_into('<Q', data, offset + 8, (address + delta) & MASK64)
++            elif command == LC_UNIXTHREAD:
++                address, = struct.unpack_from('<Q', data, offset + 272)
++                struct.pack_into('<Q', data, offset + 272, (address + delta) & MASK64)
++            elif command == LC_SYMTAB:
++                symoff, count = struct.unpack_from('<II', data, offset + 8)
++                for index in range(count):
++                    symbol = symoff + 16 * index
++                    kind = data[symbol + 4]
++                    if not kind & 0xe0 and kind & 0x0e == 0x0e:
++                        value, = struct.unpack_from('<Q', data, symbol + 8)
++                        struct.pack_into('<Q', data, symbol + 8, (value + delta) & MASK64)
++    segment, metadata = prelink_info(cache)
++    retained, dropped_personalities = [], []
++    for entry in metadata['_PrelinkInfoDictionary']:
++        if closure is not None and entry['CFBundleIdentifier'] not in closure:
++            continue
++        kmod = entry.get('_PrelinkKmodInfo', 0) & MASK64
++        if kmod:
++            field = cache.offset(kmod + 156, 8)
++            value, = struct.unpack_from('<Q', data, field)
++            if value:
++                cache.offset(value)  # refuse a non-collection raw address
++                struct.pack_into('<Q', data, field, (value + delta) & MASK64)
++        for key in ('_PrelinkExecutableLoadAddr', '_PrelinkExecutableSourceAddr', '_PrelinkKmodInfo'):
++            value = entry.get(key, 0) & MASK64
++            if value not in (0, MASK64, (1 << 63) - 1):
++                cache.offset(value)
++                entry[key] = signed((value + delta) & MASK64, 64)
++        if roots and entry['CFBundleIdentifier'] not in roots and entry.pop('IOKitPersonalities', None):
++            # A dependency is loaded for its code. Its drivers would match this board's device tree
++            # (cpu, pmgr, platform expert) and start against hardware they were not written for.
++            dropped_personalities.append(entry['CFBundleIdentifier'])
++        entry.pop('_NativePrelinkEarlySecurityInit', None)
++        if entry['CFBundleIdentifier'] in (early_security_init or {}):
++            # native-security-init.patch: OSKext calls this original registration routine after start.
++            if entry.get('AppleSecurityExtension') is not True:
++                raise ValueError(f'{entry["CFBundleIdentifier"]} is not a security extension')
++            entry['_NativePrelinkEarlySecurityInit'] = signed(
++                (early_security_init[entry['CFBundleIdentifier']] + delta) & MASK64, 64)
++        retained.append(entry)
++    missing = set(early_security_init or {}) - {e['CFBundleIdentifier'] for e in retained}
++    if missing:
++        raise ValueError(f'Early security initializers for components outside the collection: {sorted(missing)}')
++    metadata['_PrelinkInfoDictionary'] = retained
++    xml = plistlib.dumps(metadata, sort_keys=False) + b'\0'
++    if len(xml) > segment['filesize']:
++        raise ValueError('Rebased prelink metadata exceeds its segment')
++    begin, size = segment['fileoff'], segment['filesize']
++    data[begin:begin + size] = xml + bytes(size - len(xml))
++    return Image(bytes(data)), delta, dropped_personalities
++
++
++def ranges(segments):
++    return [(s['va'], s['va'] + s['size']) for s in segments if s['size'] and s['name'] != '__LINKEDIT']
++
++
++def inside(items, address):
++    return any(b <= address < e for b, e in items)
++
++
++def chain_word(auth, key, diversity, address_diversity, target_offset, step):
++    if not 0 <= target_offset < 1 << 30 or not 0 <= step < 1 << 12:
++        raise ValueError('Chained pointer target or next step is out of range')
++    value = (target_offset & 0x3fffffff) | ((step & 0xfff) << 51)
++    if auth:
++        value |= 1 << 63 | ((key & 3) << 49) | ((diversity & 0xffff) << 32) | ((address_diversity & 1) << 48)
++    return value
++
++
++def decode(value):
++    """Format 8 chain word -> (target offset, auth, key, diversity, address diversity, step)."""
++    if (value >> 30) & 3:
++        raise ValueError('Only kernel cache level 0 is supported')
++    auth = value >> 63
++    return (value & 0x3fffffff, auth, (value >> 49) & 3, (value >> 32) & 0xffff,
++            (value >> 48) & 1, (value >> 51) & 0xfff)
++
++
++class ChainReader:
++    """Ordered chain sites of every root segment that carries a table."""
++
++    def __init__(self, data, image):
++        self.data, self.image = data, image
++        found = image.command(LC_DYLD_CHAINED_FIXUPS)
++        dataoff, _ = struct.unpack_from('<II', data, found[0] + 8)
++        _, starts_offset, _, _, imports, _, _ = struct.unpack_from('<7I', data, dataoff)
++        if imports:
++            raise ValueError('Chained fixup imports are not supported')
++        table = dataoff + starts_offset
++        count, = struct.unpack_from('<I', data, table)
++        self.tables = {}
++        for index in range(count):
++            relative, = struct.unpack_from('<I', data, table + 4 + 4 * index)
++            if not relative:
++                continue
++            at = table + relative
++            _, page_size, fmt, segment_offset, _, pages = struct.unpack_from('<IHHQIH', data, at)
++            if fmt != 8 or page_size != PAGE:
++                raise ValueError(f'Unsupported chain table: format {fmt}, page {page_size}')
++            segment = next((s for s in image.segments if s['va'] - image.base == segment_offset), None)
++            if segment is None:
++                raise ValueError(f'Chain table outside known segments: {segment_offset:#x}')
++            self.tables[segment['name']] = (at, pages)
++
++    def pages(self, name):
++        """page -> ordered [(offset in page, value)]."""
++        found = self.tables.get(name)
++        if not found:
++            return {}
++        at, count = found
++        result = {}
++        for page, start in enumerate(struct.unpack_from(f'<{count}H', self.data, at + 22)):
++            if start == 0xffff:
++                continue
++            if start & 0x8000:
++                raise ValueError('Multi-start pages are not supported')
++            offset, sites = start, []
++            while True:
++                value, = struct.unpack_from('<Q', self.data,
++                                            next(s for s in self.image.segments if s['name'] == name)['fileoff']
++                                            + page * PAGE + offset)
++                sites.append((offset, value))
++                step = (value >> 51) & 0xfff
++                if not step:
++                    break
++                offset += step * 4
++                if offset >= PAGE:
++                    raise ValueError('Chain crosses a page boundary')
++            result[page] = sites
++        return result
++
++
++class Emit:
++    def __init__(self, cache, native, pairs, closure=None):
++        self.data = bytearray(cache.data)
++        self.cache, self.native, self.pairs = cache, native, pairs
++        _, at = cache.entries['com.apple.kernel']
++        self.old = Image(bytes(cache.data), at)
++        self.old_ranges = ranges(self.old.segments)
++        self.entry_ranges = {}
++        for name, (va, entry_at) in cache.entries.items():
++            self.entry_ranges[name] = ranges(Image(bytes(cache.data), entry_at).segments)
++        self.owner_ranges = sorted((begin, end, name) for name, items in self.entry_ranges.items()
++                                   for begin, end in items)
++        self.owner_starts = [begin for begin, _, _ in self.owner_ranges]
++        self.closure = closure
++        self.slide = self.fileoff = self.fixups_at = 0
++        self.native_pages = {}
++        self.report = Counter()
++        self.missing = defaultdict(Counter)
++
++    def in_closure(self, address):
++        return self.closure is None or self.owner(address) in self.closure
++
++
++    def owner(self, address):
++        index = bisect_right(self.owner_starts, address) - 1
++        if index >= 0:
++            begin, end, name = self.owner_ranges[index]
++            if address < end:
++                return name
++        return 'com.apple.kernel'
++
++    def mapped(self, address):
++        return inside(self.old_ranges, address)
++
++    def rebind(self, target, site):
++        if not self.mapped(target):
++            return target
++        native = self.pairs.get(target)
++        if native is None:
++            self.missing[self.owner(site)][target] += 1
++            return None
++        return (native + self.slide) & ((1 << 64) - 1)
++
++    def place_kernel(self):
++        """Copy the native kernel after the original file, slid above every original segment."""
++        native_end = max(s['fileoff'] + s['filesize'] for s in self.native.segments if s['filesize'])
++        self.fileoff = (len(self.data) + PAGE - 1) & ~(PAGE - 1)
++        # Root __LINKEDIT grows over the appended file bytes. Reserve its entire
++        # eventual mapping before placing the native segments, including tables.
++        _, fixups_size = struct.unpack_from('<II', self.cache.data,
++                                           self.cache.command(LC_DYLD_CHAINED_FIXUPS)[0] + 8)
++        native_tables = sum(22 + 2 * ((s['filesize'] + PAGE - 1) // PAGE)
++                            for s in self.native.segments)
++        top = max(max(s['va'] + s['size'] for s in self.cache.segments if s['size']),
++                  self.cache.base + self.fileoff + native_end + fixups_size + native_tables + PAGE)
++        base = (top + PAGE - 1) & ~(PAGE - 1)
++        self.slide = (base - self.native.base) & ((1 << 64) - 1)
++        self.data.extend(bytes(self.fileoff + native_end - len(self.data)))
++        for segment in self.native.segments:
++            if not segment['filesize']:
++                continue
++            at = self.fileoff + segment['fileoff']
++            self.data[at:at + segment['filesize']] = \
++                self.native.data[segment['fileoff']:segment['fileoff'] + segment['filesize']]
++        new = ranges(self.native.segments)
++        for start, end in new:
++            start, end = (start + self.slide) & ((1 << 64) - 1), (end + self.slide) & ((1 << 64) - 1)
++            if any(b < end and start < e for b, e in self.old_ranges + ranges(self.cache.segments)):
++                raise ValueError(f'Native segment {start:#x} collides with the original collection')
++
++    def rewrite_native_chains(self):
++        """The native kernel's own format 7 fixups become format 8 words in the copy."""
++        sites_by_segment = defaultdict(dict)
++        for site, value in self.native.fixups().items():
++            segment = next((s for s in self.native.segments
++                            if s['va'] <= site < s['va'] + s['filesize'] and s['filesize']), None)
++            if segment is None:
++                raise ValueError(f'Native fixup site outside file-backed segments: {site:#x}')
++            sites_by_segment[segment['name']][site - segment['va']] = value
++        for segment in self.native.segments:
++            sites = sites_by_segment.get(segment['name'])
++            if not sites:
++                continue
++            pages = defaultdict(list)
++            for offset in sorted(sites):
++                pages[offset // PAGE].append(offset)
++            self.native_pages[segment['name']] = {page: offsets for page, offsets in pages.items()}
++            for page, offsets in pages.items():
++                for index, offset in enumerate(offsets):
++                    target, auth, key, diversity, address_diversity = sites[offset]
++                    step = (offsets[index + 1] - offset) // 4 if index + 1 < len(offsets) else 0
++                    target_offset = (target + self.slide - self.cache.base) & MASK64
++                    at = self.fileoff + segment['fileoff'] + offset
++                    struct.pack_into('<Q', self.data, at,
++                                     chain_word(auth, key, diversity, address_diversity, target_offset, step))
++            self.report['native_chain_sites'] += len(sites)
++
++    def rebuild_linkedit(self):
++        """One starts table for the collection: patched kext chains plus converted native chains."""
++        reader = ChainReader(bytes(self.data), self.cache)
++        order = [s for s in self.cache.segments] + [s for s in self.native.segments if s['size']]
++        blob = bytearray(4 + 4 * len(order))
++        offsets = []
++
++        def append_piece(segment_fileoff, segment_offset, pages_of_sites):
++            piece = bytearray(22 + 2 * (max(pages_of_sites) + 1))
++            piece[22:] = b'\xff' * (len(piece) - 22)
++            for page, chain in pages_of_sites.items():
++                for index, (offset, target_offset, auth, key, diversity, address_diversity) in enumerate(chain):
++                    step = (chain[index + 1][0] - offset) // 4 if index + 1 < len(chain) else 0
++                    at = segment_fileoff + page * PAGE + offset
++                    struct.pack_into('<Q', self.data, at,
++                                     chain_word(auth, key, diversity, address_diversity, target_offset, step))
++                struct.pack_into('<H', piece, 22 + 2 * page, chain[0][0])
++            struct.pack_into('<IHHQIH', piece, 0, len(piece), PAGE, 8, segment_offset, 0,
++                             max(pages_of_sites) + 1)
++            offsets.append(len(blob))
++            blob.extend(piece)
++
++        for segment in self.cache.segments:
++            pages = reader.pages(segment['name'])
++            if not pages:
++                offsets.append(0)
++                continue
++            kept = {}
++            for page, sites in pages.items():
++                chain = []
++                for offset, value in sites:
++                    site = segment['va'] + page * PAGE + offset
++                    if self.mapped(site):
++                        self.report['old_kernel_sites_dropped'] += 1
++                        continue
++                    if not self.in_closure(site):
++                        self.report['unselected_chain_sites_dropped'] += 1
++                        continue
++                    target_offset, auth, key, diversity, address_diversity, _ = decode(value)
++                    target = self.cache.base + target_offset
++                    if self.mapped(target):
++                        if not self.in_closure(site):
++                            chain.append((offset, target_offset, auth, key, diversity, address_diversity))
++                            continue
++                        rebound = self.rebind(target, site)
++                        if rebound is None:
++                            self.report['closure_pointers_unmapped'] += 1
++                            chain.append((offset, target_offset, auth, key, diversity, address_diversity))
++                            continue
++                        target_offset = (rebound - self.cache.base) & MASK64
++                        self.report['kext_pointers_rebound'] += 1
++                    chain.append((offset, target_offset, auth, key, diversity, address_diversity))
++                if chain:
++                    kept[page] = chain
++            if not kept:
++                offsets.append(0)
++                continue
++            append_piece(segment['fileoff'], segment['va'] - self.cache.base, kept)
++            self.report['kext_chain_sites_kept'] += sum(len(c) for c in kept.values())
++        for segment in self.native.segments:
++            if not segment['size']:
++                continue
++            pages = self.native_pages.get(segment['name'])
++            if not pages:
++                offsets.append(0)
++                continue
++            kept = {}
++            for page, offsets_in_page in pages.items():
++                chain = []
++                for index, offset in enumerate(offsets_in_page):
++                    value, = struct.unpack_from('<Q', self.data,
++                                                self.fileoff + segment['fileoff'] + offset)
++                    target_offset, auth, key, diversity, address_diversity, _ = decode(value)
++                    chain.append((offset - page * PAGE, target_offset, auth, key, diversity,
++                                  address_diversity))
++                kept[page] = chain
++            append_piece(self.fileoff + segment['fileoff'],
++                         (segment['va'] + self.slide - self.cache.base) & ((1 << 64) - 1), kept)
++        struct.pack_into('<I', blob, 0, len(order))
++        for index, offset in enumerate(offsets):
++            struct.pack_into('<I', blob, 4 + 4 * index, offset)
++        self.fixups_at = (len(self.data) + 15) & ~15
++        self.data.extend(bytes(self.fixups_at - len(self.data)))
++        self.data.extend(struct.pack('<7I', 0, 28, 28, 28, 0, 1, 0))
++        self.data.extend(blob)
++
++    def rewrite_branches(self):
++        """Kext BL/B, ADR and adrp pairs into the old kernel become native kernel references."""
++        for segment in self.cache.segments:
++            if segment['name'] != '__TEXT_EXEC' or not segment['filesize']:
++                continue
++            blob = bytes(self.cache.data[segment['fileoff']:segment['fileoff'] + segment['filesize']])
++            literals = inline_data_ranges(blob)
++            self.report['inline_data_pools_preserved'] += len(literals)
++            self.report['inline_data_bytes_preserved'] += sum(end - begin for begin, end in literals)
++            pages = {}
++            for offset in range(0, len(blob) - 3, 4):
++                if inside(literals, offset):
++                    pages.clear()
++                    continue
++                word, = struct.unpack_from('<I', blob, offset)
++                pc = segment['va'] + offset
++                if inside(self.old_ranges, pc):
++                    continue
++                if word & BRANCH_MASK == BRANCH_VALUE:
++                    target = pc + signed(word & 0x3ffffff, 26) * 4
++                    if self.mapped(target) and self.in_closure(pc):
++                        rebound = self.rebind(target, pc)
++                        if rebound is None:
++                            self.report['closure_branches_unmapped'] += 1
++                            continue
++                        delta = (rebound - pc) >> 2
++                        if abs(delta) >= 1 << 25 or (rebound - pc) & 3:
++                            raise ValueError(f'Branch out of range at {pc:#x}')
++                        struct.pack_into('<I', self.data, segment['fileoff'] + offset,
++                                         (word & 0xfc000000) | (delta & 0x3ffffff))
++                        self.report['branches_rebound'] += 1
++                    if word >> 31:
++                        for register in list(pages):
++                            pages.pop(register)
++                    continue
++                if word & ADRP_MASK == ADRP_VALUE:
++                    immediate = signed(((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3), 21)
++                    pages[word & 31] = (((pc & ~4095) + (immediate << 12)) & ((1 << 64) - 1), offset)
++                elif word & ADR_MASK == ADR_VALUE:
++                    immediate = signed(((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3), 21)
++                    address = (pc + immediate) & ((1 << 64) - 1)
++                    if self.mapped(address) and self.in_closure(pc):
++                        rebound = self.rebind(address, pc)
++                        if rebound is None:
++                            continue
++                        new_immediate = rebound - pc
++                        if abs(new_immediate) >= 1 << 20:
++                            raise ValueError(f'Adr out of range at {pc:#x}')
++                        word = (word & 0x9f00001f) | (((new_immediate >> 2) & 0x7ffff) << 5) \
++                            | ((new_immediate & 3) << 29)
++                        struct.pack_into('<I', self.data, segment['fileoff'] + offset, word)
++                        self.report['adr_rebound'] += 1
++                else:
++                    base = (word >> 5) & 31
++                    if base not in pages:
++                        continue
++                    page_value, adrp_offset = pages[base]
++                    if word & 0xff800000 == 0x91000000:
++                        shift = 12 if word & 0x400000 else 0
++                        address = (page_value + (((word >> 10) & 0xfff) << shift)) & ((1 << 64) - 1)
++                        if self.mapped(address) and self.in_closure(pc):
++                            rebound = self.rebind(address, pc)
++                            if rebound is None:
++                                pages.pop(base, None)
++                                continue
++                            if shift or rebound & 0xfff != address & 0xfff:
++                                raise ValueError(f'Adrp+add cannot express {rebound:#x} at {pc:#x}')
++                            self.patch_adrp_pair(segment, adrp_offset, offset, rebound, 0)
++                    elif word & 0x3b000000 == 0x39000000:
++                        size = word >> 30
++                        if word & 0x04800000 == 0x04800000:
++                            size = 4
++                        address = (page_value + (((word >> 10) & 0xfff) << size)) & ((1 << 64) - 1)
++                        if self.mapped(address) and self.in_closure(pc):
++                            rebound = self.rebind(address, pc)
++                            if rebound is None:
++                                pages.pop(base, None)
++                                continue
++                            if (rebound ^ address) & (size and (1 << size) - 1 or 0xfff):
++                                raise ValueError(f'Adrp+ldst cannot express {rebound:#x} at {pc:#x}')
++                            self.patch_adrp_pair(segment, adrp_offset, offset, rebound, size)
++                    else:
++                        continue
++                    pages.pop(base, None)
++
++    def patch_adrp_pair(self, segment, adrp_offset, use_offset, rebound, size):
++        word, = struct.unpack_from('<I', self.data, segment['fileoff'] + adrp_offset)
++        pc = segment['va'] + adrp_offset
++        immediate = ((rebound & ~4095) - (pc & ~4095)) >> 12
++        if abs(immediate) >= 1 << 20:
++            raise ValueError(f'Adrp out of range at {pc:#x}')
++        struct.pack_into('<I', self.data, segment['fileoff'] + adrp_offset,
++                         (word & 0x9f00001f) | (((immediate >> 2) & 0x7ffff) << 5) | ((immediate & 3) << 29))
++        use, = struct.unpack_from('<I', self.data, segment['fileoff'] + use_offset)
++        low = (rebound & 0xfff) >> size
++        struct.pack_into('<I', self.data, segment['fileoff'] + use_offset, (use & 0xffc003ff) | (low << 10))
++        self.report['adrp_pairs_rebound'] += 1
++
++    def patch_entry_header(self):
++        """Rebase the copied native kernel header: slide vmaddrs, shift file offsets."""
++        at = self.fileoff
++        rebuilt = []
++        for command, offset, length in self.native.commands:
++            blob = bytearray(self.native.data[offset:offset + length])
++            if command == LC_DYLD_CHAINED_FIXUPS:
++                continue  # the collection's root chains govern the entry
++            if command == LC_SEGMENT_64:
++                vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', blob, 24)
++                struct.pack_into('<QQ', blob, 24, (vmaddr + self.slide) & ((1 << 64) - 1), vmsize)
++                if filesize:
++                    struct.pack_into('<Q', blob, 40, fileoff + at)
++                nsects, = struct.unpack_from('<I', blob, 64)
++                for index in range(nsects):
++                    s = 72 + 80 * index
++                    address, = struct.unpack_from('<Q', blob, s + 32)
++                    struct.pack_into('<Q', blob, s + 32, (address + self.slide) & ((1 << 64) - 1))
++                    for field in (48, 56):  # section data and relocation offsets
++                        value, = struct.unpack_from('<I', blob, s + field)
++                        if value:
++                            struct.pack_into('<I', blob, s + field, value + at)
++            elif command == LC_SYMTAB:
++                symoff, nsyms, stroff, strsize = struct.unpack_from('<4I', blob, 8)
++                struct.pack_into('<4I', blob, 8, symoff + at, nsyms, stroff + at, strsize)
++                for index in range(nsyms):
++                    symbol = at + symoff + 16 * index
++                    kind = self.data[symbol + 4]
++                    if not kind & 0xe0 and kind & 0x0e == 0x0e:
++                        value, = struct.unpack_from('<Q', self.data, symbol + 8)
++                        struct.pack_into('<Q', self.data, symbol + 8,
++                                         (value + self.slide) & ((1 << 64) - 1))
++            elif command in (0x1d, 0x1e, 0x26, 0x29, 0x2b, 0x2e, 0x80000033):
++                value, = struct.unpack_from('<I', blob, 8)
++                if value:
++                    struct.pack_into('<I', blob, 8, value + at)
++            elif command == 0xb:
++                for field in (32, 40, 48, 56, 64, 72):
++                    value, = struct.unpack_from('<I', blob, field)
++                    if value:
++                        struct.pack_into('<I', blob, field, value + at)
++            elif command in (0x22, 0x80000022):
++                for field in (8, 16, 24, 32, 40):
++                    value, = struct.unpack_from('<I', blob, field)
++                    if value:
++                        struct.pack_into('<I', blob, field, value + at)
++            elif command == LC_UNIXTHREAD:
++                pc, = struct.unpack_from('<Q', blob, 16 + 256)
++                struct.pack_into('<Q', blob, 16 + 256, (pc + self.slide) & ((1 << 64) - 1))
++            rebuilt.append(bytes(blob))
++        payload = b''.join(rebuilt)
++        first = 32 + struct.unpack_from('<I', self.native.data, 20)[0]
++        if len(payload) + 32 > first:
++            raise ValueError('Rebuilt entry header overruns its payload')
++        self.data[at + 32:at + first] = payload + bytes(first - 32 - len(payload))
++        struct.pack_into('<II', self.data, at + 16, len(rebuilt), len(payload))
++        flags, = struct.unpack_from('<I', self.data, at + 24)
++        struct.pack_into('<I', self.data, at + 24, flags | MH_DYLIB_IN_CACHE)
++
++    def patch_headers(self):
++        """Repoint the kernel entry, add native segments, grow linkedit, move the entry PC."""
++        at = None
++        for command, offset, length in self.cache.commands:
++            if command == LC_FILESET_ENTRY:
++                _, _, name_at = struct.unpack_from('<QQI', self.data, offset + 8)
++                end = self.data.index(b'\0', offset + name_at)
++                if self.data[offset + name_at:end].decode() == 'com.apple.kernel':
++                    at = offset
++        if at is None:
++            raise ValueError('No com.apple.kernel fileset entry')
++        struct.pack_into('<QQ', self.data, at + 8, (self.native.base + self.slide) & ((1 << 64) - 1),
++                         self.fileoff)
++        extra = []
++        for segment in self.native.segments:
++            if not segment['size']:
++                continue
++            command = next(o for c, o, l in self.native.commands if c == LC_SEGMENT_64
++                           and self.native.data[o + 8:o + 24].rstrip(b'\0').decode() == segment['name'])
++            maxprot, initprot = struct.unpack_from('<II', self.native.data, command + 56)
++            extra.append(struct.pack('<II16sQQQQIIII', LC_SEGMENT_64, 72,
++                                     ('__N' + segment['name'][2:]).encode()[:16].ljust(16, b'\0'),
++                                     (segment['va'] + self.slide) & ((1 << 64) - 1), segment['size'],
++                                     self.fileoff + segment['fileoff'] if segment['filesize'] else 0,
++                                     segment['filesize'], maxprot, initprot, 0, 0))
++        assert all(len(blob) == 72 for blob in extra)
++        grown_bytes = b''.join(extra)
++        end_of_commands = max(offset + length for command, offset, length in self.cache.commands)
++        limit = next(s['filesize'] for s in self.cache.segments if s['name'] == '__TEXT')
++        # Entry names live inside their own commands; the rest of the header page is zero padding.
++        if end_of_commands + len(grown_bytes) > limit:
++            raise ValueError('No room in the root header for the native segments')
++        new_size = len(self.data) - self.fixups_at
++        for command, offset, length in self.cache.commands:
++            if command == LC_DYLD_CHAINED_FIXUPS:
++                struct.pack_into('<II', self.data, offset + 8, self.fixups_at, new_size)
++        linkedit = next(s for s in self.cache.segments if s['name'] == '__LINKEDIT')
++        grown = len(self.data) - linkedit['fileoff']
++        linkedit_end = linkedit['va'] + ((grown + PAGE - 1) & ~(PAGE - 1))
++        if linkedit_end > (self.native.base + self.slide) & ((1 << 64) - 1):
++            raise ValueError('Expanded root __LINKEDIT overlaps the native kernel')
++        struct.pack_into('<QQQ', self.data, linkedit['command_offset'] + 32,
++                         (grown + PAGE - 1) & ~(PAGE - 1), linkedit['fileoff'], grown)
++        native_pc = None
++        for command, offset, length in self.native.commands:
++            if command == LC_UNIXTHREAD:
++                native_pc = struct.unpack_from('<Q', self.native.data, offset + 16 + 256)[0]
++        for command, offset, length in self.cache.commands:
++            if command == LC_UNIXTHREAD and native_pc:
++                struct.pack_into('<Q', self.data, offset + 16 + 256,
++                                 (native_pc + self.slide) & ((1 << 64) - 1))
++        rebuilt = []
++        for command, offset, length in self.cache.commands:
++            if command == LC_FILESET_ENTRY and self.closure is not None:
++                name_at, = struct.unpack_from('<I', self.data, offset + 24)
++                end = self.data.index(b'\0', offset + name_at)
++                name = self.data[offset + name_at:end].decode()
++                if name != 'com.apple.kernel' and name not in self.closure:
++                    self.report['unselected_entries_dropped'] += 1
++                    continue
++            rebuilt.append(bytes(self.data[offset:offset + length]))
++        rebuilt.extend(extra)
++        commands = b''.join(rebuilt)
++        self.data[32:end_of_commands + len(grown_bytes)] = commands + bytes(
++            end_of_commands + len(grown_bytes) - 32 - len(commands))
++        struct.pack_into('<II', self.data, 16, len(rebuilt), len(commands))
++        self.report['native_base'] = f'{(self.native.base + self.slide) & ((1 << 64) - 1):#x}'
++        self.report['native_fileoff'] = f'{self.fileoff:#x}'
++
++
++def reviewed_sites(inputs, native, collection_slide):
++    """Reviewed per-site bindings: one original pointer site (a component's GOT slot) bound to a named native object.
++    Used when a kernel object means different things to different consumers, so pairing its target is not enough."""
++    names = {}
++    for address, symbols in native.symbols().items():
++        for name in symbols:
++            names[name] = address
++    sites = {}
++    for path in sorted((Path(__file__).parent / 'fixtures').glob('fileset-*-symbols.json')):
++        record = json.loads(path.read_text())
++        pinned = record['inputs']
++        if (pinned['kernelcache_sha256'], pinned['entry']) != (inputs['kernelcache_sha256'], inputs['entry']):
++            continue
++        for entry in record.get('sites', []):
++            if not entry.get('evidence'):
++                raise ValueError('Reviewed site requires recorded evidence')
++            if entry['native_symbol'] not in names:
++                raise ValueError(f'Reviewed site names a missing native symbol: {entry["native_symbol"]}')
++            sites[(int(entry['site'], 16) + collection_slide) & MASK64] = names[entry['native_symbol']]
++    return sites
++
++
++def validate_map(raw, native_data, payload):
++    expected = {'kernelcache_sha256': hashlib.sha256(raw).hexdigest(),
++                'native_sha256': hashlib.sha256(native_data).hexdigest(),
++                'entry': 'com.apple.kernel'}
++    if payload.get('inputs') != expected:
++        raise ValueError('Pairing inputs do not match these images; rerun fileset_match.py')
++    return expected
++
++
++def emit_images(raw, native_data, payload, roots, stub_symbol=None, early_security_init=None):
++    inputs = validate_map(raw, native_data, payload)
++    from fileset_match import MATCHER_VERSION, matcher_signature
++    if payload.get('matcher_version') != MATCHER_VERSION or payload.get('matcher_signature') != matcher_signature():
++        raise ValueError('Pairing predates the current matching checks; rerun fileset_match.py')
++    cache, native = Image(raw), Image(native_data)
++    if cache.kind != 12 or native.kind != 2:
++        raise ValueError('Expected an MH_FILESET collection and an MH_EXECUTE native kernel')
++    pairs = {int(key, 16): int(value['native'], 16) for key, value in payload['functions'].items()}
++    pairs.update({int(key, 16): int(value['native'], 16) for key, value in payload['data'].items()})
++    closure = dependency_closure(cache, roots)
++    for identifier, address in (early_security_init or {}).items():
++        entry = Image(cache.data, cache.entries[identifier][1])
++        if not any(s['name'] == '__TEXT_EXEC' and s['va'] <= address < s['va'] + s['size'] for s in entry.segments):
++            raise ValueError(f'Early security initializer {address:#x} is outside {identifier} code')
++    cache, collection_slide, dropped_personalities = rebase_collection(
++        cache, native.base, closure, early_security_init, set(roots))
++    pairs = {(address + collection_slide) & MASK64: target for address, target in pairs.items()}
++    from fileset_segmented import SegmentedEmit
++    emit = SegmentedEmit(cache, native, pairs, closure)
++    emit.site_pairs = reviewed_sites(inputs, native, collection_slide)
++    emit.stub, emit.stubbed = None, defaultdict(Counter)
++    emit.old_starts = set(emit.old.function_starts())
++    if stub_symbol:
++        found = [address for address, names in native.symbols().items() if stub_symbol in names]
++        if len(found) != 1:
++            raise ValueError(f'Native kernel has no unique {stub_symbol}')
++        emit.stub = found[0]
++    emit.place_kernel()
++    emit.rewrite_native_chains()
++    emit.rebuild_linkedit()
++    emit.rewrite_branches()
++    emit.seal_components()
++    emit.patch_entry_header()
++    emit.patch_headers()
++    image = bytes(emit.data)
++    return image, {
++        'format': 'MH_FILESET', 'inputs': inputs,
++        'matcher_version': payload['matcher_version'], 'matcher_signature': payload['matcher_signature'],
++        'reference_sha256': payload.get('reference_sha256'),
++        'closure': sorted(closure) if closure is not None else None,
++        'collection_base': hex(cache.base), 'collection_slide': hex(collection_slide),
++        'native_link_address': hex(native.base), 'statistics': dict(emit.report),
++        'native_original_branches': emit.original_branches,
++        'missing': {owner: {hex(target): count for target, count in sorted(targets.items())}
++                    for owner, targets in sorted(emit.missing.items())},
++        'stubbed': {owner: {hex(target): count for target, count in sorted(targets.items())}
++                    for owner, targets in sorted(emit.stubbed.items())},
++        'stub_symbol': stub_symbol,
++        'personalities_dropped': dropped_personalities,
++        'early_security_init': {k: hex(v) for k, v in (early_security_init or {}).items()},
++        'missing_address_space': 'output collection',
++        'mapping_complete': not bool(emit.missing), 'runtime_qualified': False, 'loadable': False,
++        'candidate_bytes': len(image), 'candidate_sha256': hashlib.sha256(image).hexdigest(),
++    }
++
++
++def atomic_write(path, contents):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    name = None
++    try:
++        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '.', delete=False) as f:
++            name = f.name
++            f.write(contents)
++        os.replace(name, path)
++    finally:
++        if name and os.path.exists(name):
++            os.unlink(name)
++
++
++def write_candidate(image, report, output, report_path, allow_missing=False):
++    report['output'] = str(Path(output).resolve())
++    report['candidate_written'] = False
++    if report['missing'] and not allow_missing:
++        atomic_write(report_path, (json.dumps(report, indent=2) + '\n').encode())
++        total = sum(sum(targets.values()) for targets in report['missing'].values())
++        raise ValueError(f'Incomplete pairing: {total} unresolved references; see {report_path}')
++    atomic_write(output, image)
++    report['candidate_written'] = True
++    report['allow_missing'] = allow_missing
++    atomic_write(report_path, (json.dumps(report, indent=2) + '\n').encode())
++    print(f'wrote {output} ({len(image)} bytes)')
++    total = sum(sum(targets.values()) for targets in report['missing'].values())
++    stubbed = sum(len(targets) for targets in report.get('stubbed', {}).values())
++    print(f'unresolved closure references: {total}; stubbed functions: {stubbed}; runtime qualification: pending')
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('kernelcache')
++    parser.add_argument('native')
++    parser.add_argument('--map', required=True, help='fileset_match JSON pairing for these exact inputs')
++    parser.add_argument('--output', required=True)
++    parser.add_argument('--report', help='defaults to OUTPUT with a .json suffix')
++    parser.add_argument('--root', action='append', default=[], help='root bundle id and its dependencies')
++    parser.add_argument('--allow-missing', action='store_true', help='emit an incomplete experimental image')
++    parser.add_argument('--unmapped-stub', metavar='SYMBOL',
++                        help='native function that receives calls to unmapped original kernel functions')
++    parser.add_argument('--early-security-init', action='append', default=[], metavar='BUNDLE=ORIGINAL_VA',
++                        help='original registration routine OSKext runs after this component starts')
++    args = parser.parse_args()
++    early = {}
++    for item in args.early_security_init:
++        identifier, _, address = item.partition('=')
++        early[identifier] = int(address, 0)
++    payload = json.loads(Path(args.map).read_text())
++    image, report = emit_images(Path(args.kernelcache).read_bytes(), Path(args.native).read_bytes(),
++                                payload, args.root, args.unmapped_stub, early)
++    report.update(kernelcache=str(Path(args.kernelcache).resolve()), native=str(Path(args.native).resolve()),
++                  map=str(Path(args.map).resolve()))
++    write_candidate(image, report, args.output, args.report or Path(args.output).with_suffix('.json'),
++                    args.allow_missing)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/kits/NativePrelink/fileset_layout.py b/kits/NativePrelink/fileset_layout.py
+new file mode 100644
+index 0000000..6d237c1
+--- /dev/null
++++ b/kits/NativePrelink/fileset_layout.py
+@@ -0,0 +1,357 @@
++"""Segment placement and linker-authored split-segment relocations for filesets.
++
++The v2 record grammar is documented by Apple's dyld mach_o/SplitSeg.cpp.
++Section zero denotes the Mach-O header; other ordinals follow load-command order.
++"""
++from collections import Counter
++import struct
++
++PAGE = 0x4000
++MASK64 = (1 << 64) - 1
++
++
++def align(value, alignment=PAGE):
++    return (value + alignment - 1) & -alignment
++
++
++def split_references(image):
++    found = image.command(0x1e)
++    if found is None:
++        raise ValueError('Native image has no split-segment relocation information')
++    offset, size = struct.unpack_from('<II', image.data, found[0] + 8)
++    blob = image.data[offset:offset + size]
++    if len(blob) != size or not blob or blob[0] != 0x7f:
++        raise ValueError('Expected complete split-segment v2 information')
++    at = 1
++
++    def uleb():
++        nonlocal at
++        result = 0
++        for shift in range(0, 70, 7):
++            if at >= len(blob):
++                raise ValueError('Truncated split-segment ULEB')
++            byte = blob[at]
++            at += 1
++            result |= (byte & 127) << shift
++            if not byte & 128:
++                if result > MASK64:
++                    raise ValueError('Overflowing split-segment ULEB')
++                return result
++        raise ValueError('Overflowing split-segment ULEB')
++
++    for _ in range(uleb()):
++        source, target, count = uleb(), uleb(), uleb()
++        if max(source, target) > len(image.sections):
++            raise ValueError('Split-segment section ordinal is out of bounds')
++        target_offset = 0
++        for _ in range(count):
++            target_offset += uleb()
++            for _ in range(uleb()):
++                kind, count_sources = uleb(), uleb()
++                if not 1 <= kind <= 13:
++                    raise ValueError(f'Invalid split-segment kind {kind}')
++                source_offset = 0
++                for _ in range(count_sources):
++                    source_offset += uleb()
++                    yield kind, source, source_offset, target, target_offset
++    if any(blob[at:]):
++        raise ValueError('Unexpected bytes after split-segment records')
++
++
++def chained_pointer(image, source):
++    """Decode the link-time chained-fixup word stored at one pointer site.
++
++    A classic arm64e kernel carries no LC_DYLD_CHAINED_FIXUPS, but ld64 still
++    writes every rebased pointer in the chained-fixup encoding: an authenticated
++    entry carries its PAC key, diversity and target offset, a plain entry the
++    51-bit compressed target. Decoding the word itself therefore recovers the
++    metadata the root chain writer needs, without a linker-authored table.
++    """
++    value, = struct.unpack_from('<Q', image.data, image.offset(source, 8))
++    if value >> 63:
++        return (image.base + (value & 0xffffffff), 1, (value >> 49) & 3,
++                (value >> 32) & 0xffff, (value >> 48) & 1)
++    top8 = value & 0x0007F80000000000
++    bottom = value & 0x000007FFFFFFFFFF
++    if bottom & (1 << 42):
++        bottom -= 1 << 43
++    return (((top8 << 13) | (bottom & 0x00FFFFFFFFFFFFFF)) & MASK64, 0, None, None, None)
++
++
++def encode_uleb(value):
++    if value < 0:
++        raise ValueError('Negative ULEB')
++    result = bytearray()
++    while value >= 128:
++        result.append((value & 127) | 128)
++        value >>= 7
++    result.append(value)
++    return result
++
++
++class Layout:
++    """Fit native segments around retained kexts, preserving their relative addresses."""
++    def __init__(self, cache, native, closure):
++        from kc_image import Image
++        self.cache, self.native = cache, native
++        self.roots = {s['name']: dict(s) for s in cache.segments}
++        self.occupied = []
++        self.retained_code = []
++        for name, (_, offset) in cache.entries.items():
++            if name == 'com.apple.kernel' or closure is not None and name not in closure:
++                continue
++            for segment in Image(cache.data, offset).segments:
++                if segment['size'] and segment['name'] != '__LINKEDIT':
++                    self.occupied.append((segment['va'], segment['va'] + segment['size']))
++                if segment['name'] == '__TEXT_EXEC' and segment['filesize']:
++                    self.retained_code.append((segment['va'], segment['va'] + segment['filesize'], name))
++        self.placements = {}
++        self.cursor = align(max(len(cache.data), max(s['va'] + s['size'] - cache.base
++                                                  for s in cache.segments)))
++        self.reserve('__TEXT', self.hole('__PRELINK_TEXT', self.segment('__TEXT')['size']))
++        const = self.roots['__DATA_CONST']
++        self.reserve('__DATA_CONST', const['va'])
++        self.reserve('__LASTDATA_CONST', align(self.end('__DATA_CONST')))
++        # All native code follows selected kext code; XNU derives the kext-code
++        # range from the start of native __TEXT_EXEC.
++        code = self.roots['__TEXT_EXEC']
++        end_kept = max([code['va']] + [end for begin, end in self.occupied
++                                      if code['va'] <= begin < code['va'] + code['size']])
++        self.reserve('__TEXT_EXEC', align(end_kept))
++        self.reserve('__KLD', align(self.end('__TEXT_EXEC')))
++        self.reserve('__LAST', self.end('__KLD'))
++        code_end = self.end('__KLD')
++        # The old kernel boot segment and prelink XML are replaceable, provided
++        # no retained kext uses them. Move XML into its own mapping below.
++        if code_end > self.roots['__DATA']['va']:
++            raise ValueError('Native code would collide with collection data')
++        self.roots.pop('__TEXT_BOOT_EXEC', None)
++        code['size'] = code['filesize'] = code_end - code['va']
++        self.reserve('__DATA', self.roots['__DATA']['va'])
++        link = self.roots['__LINKEDIT']
++        for name in ('__LINKINFO', '__LINKEDIT'):
++            self.reserve(name, self.allocate(self.segment(name)['size']))
++        link['size'] = link['filesize'] = self.cursor - link['fileoff']
++        # Reserve enough root-linkedit space for new starts/fixups tables. This
++        # is derived from site counts, not a bound tied to one release.
++        fixup_count = len(cache.fixups()) + (len(native.fixups()) or
++                                            sum(1 for kind, *_ in split_references(native) if kind in (2, 13)))
++        self.table_begin = self.cursor
++        self.allocate(align(fixup_count * 2 + len(native.function_starts()) * 10 + 0x10000))
++        self.table_end = self.cursor
++        link['size'] = link['filesize'] = self.cursor - link['fileoff']
++        info = self.roots['__PRELINK_INFO']
++        info['va'] = self.allocate(info['size'])
++        info['fileoff'] = info['va'] - cache.base
++        for name in ('__KLDDATA', '__BOOTDATA'):
++            segment = self.segment(name)
++            address = self.allocate(segment['size'])
++            self.reserve(name, address)
++            self.roots[name] = dict(segment, va=address, fileoff=address-cache.base,
++                                    filesize=segment['size'])
++        # Zero-sized markers have distinct semantics even when their old
++        # addresses alias a real segment. Relocate them by section ordinal.
++        for segment in native.segments:
++            if segment['name'] in self.placements:
++                continue
++            if segment['size']:
++                raise ValueError(f'Unclassified native segment {segment["name"]}')
++            address = self.end('__DATA') if segment['name'] == '__PRELINK_DATA' else self.end('__KLD')
++            self.reserve(segment['name'], address)
++        self.size = self.cursor
++        self.validate()
++
++    def segment(self, name):
++        return next(s for s in self.native.segments if s['name'] == name)
++
++    def allocate(self, size):
++        address = self.cache.base + self.cursor
++        self.cursor = align(self.cursor + size)
++        return address
++
++    def reserve(self, name, address):
++        self.placements[name] = address
++
++    def end(self, name):
++        return self.placements[name] + self.segment(name)['size']
++
++    def hole(self, root_name, size):
++        root = self.roots[root_name]
++        cursor, limit = root['va'], root['va'] + root['size']
++        for begin, end in sorted(self.occupied):
++            if end <= cursor or begin >= limit:
++                continue
++            if align(cursor) + size <= begin:
++                return align(cursor)
++            cursor = max(cursor, end)
++        if align(cursor) + size <= limit:
++            return align(cursor)
++        raise ValueError(f'No room for {size:#x} bytes in {root_name}')
++
++    def translate(self, address):
++        matches = [s for s in self.native.segments if s['va'] <= address < s['va'] + s['size']]
++        if len(matches) != 1:
++            raise ValueError(f'Native address has no unique segment: {address:#x}')
++        segment = matches[0]
++        return self.placements[segment['name']] + address - segment['va']
++
++    def section_address(self, ordinal, offset, new=False):
++        if ordinal == 0:
++            if offset > self.segment('__TEXT')['size']:
++                raise ValueError('Header-relative split-segment offset is out of range')
++            return (self.placements['__TEXT'] if new else self.native.base) + offset
++        section = self.native.sections[ordinal - 1]
++        if offset > section['size']:
++            raise ValueError(f'Split-segment offset exceeds section {ordinal}')
++        delta = self.placements[section['segment']] - self.segment(section['segment'])['va'] if new else 0
++        return section['va'] + offset + delta
++
++    def file(self, old_offset, length=1):
++        matches = [s for s in self.native.segments
++                   if s['filesize'] and s['fileoff'] <= old_offset
++                   and old_offset + length <= s['fileoff'] + s['filesize']]
++        if len(matches) != 1:
++            raise ValueError(f'Native file offset has no unique segment: {old_offset:#x}')
++        segment = matches[0]
++        return self.placements[segment['name']] - self.cache.base + old_offset - segment['fileoff']
++
++    def validate(self):
++        placed = []
++        for segment in self.native.segments:
++            if not segment['size']:
++                continue
++            begin, end = self.placements[segment['name']], self.end(segment['name'])
++            if begin % PAGE:
++                raise ValueError('Unaligned native segment')
++            if any(begin < e and b < end for b, e in self.occupied + placed):
++                raise ValueError(f'Native {segment["name"]} overlaps a retained segment')
++            if not any(s['va'] <= begin and end <= s['va'] + s['size'] for s in self.roots.values()):
++                raise ValueError(f'Native {segment["name"]} is outside collection mappings')
++            placed.append((begin, end))
++        ordered = sorted((s['va'], s['va'] + s['size']) for s in self.roots.values() if s['size'])
++        if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
++            raise ValueError('Root mappings overlap')
++        if self.end('__LASTDATA_CONST') > min(b for b, e in self.occupied
++                                            if self.roots['__DATA_CONST']['va'] <= b < self.roots['__DATA_CONST']['va'] + self.roots['__DATA_CONST']['size']):
++            raise ValueError('Native constants follow retained kext constants')
++
++    def describe(self):
++        return {s['name']: {'old': hex(s['va']), 'new': hex(self.placements[s['name']]),
++                            'size': hex(s['size'])} for s in self.native.segments}
++
++
++def relocate_original_stubs(data, layout):
++    """Retarget BTI/B adapters to fixed kext addresses after moving native text.
++
++    ld resolves B to an N_ABS symbol without emitting a split-segment record.
++    The board declares each target as <stub>.original at its collection address;
++    the branch displacement must be recomputed from the final native location.
++    """
++    from kc_image import signed
++    native = layout.native
++    names = {}
++    for address, symbols in native.symbols().items():
++        for name in symbols:
++            names.setdefault(name, set()).add(address)
++    result = []
++    for name, target in sorted(native.absolute_symbols().items()):
++        if not name.endswith('.original'):
++            continue
++        stubs = names.get(name[:-len('.original')], ())
++        if len(stubs) != 1:
++            raise ValueError(f'Absolute original target has no unique native stub: {name}')
++        stub = next(iter(stubs))
++        bti, branch = struct.unpack('<2I', native.read(stub, 8))
++        if bti != 0xd503245f or branch & 0xfc000000 != 0x14000000:
++            raise ValueError(f'Expected BTI/B original stub: {name}')
++        if stub + 4 + signed(branch & 0x3ffffff, 26) * 4 != target:
++            raise ValueError(f'Original stub disagrees with absolute symbol: {name}')
++        owners = [owner for begin, end, owner in layout.retained_code if begin <= target < end]
++        if len(owners) != 1:
++            raise ValueError(f'Original target is not retained executable code: {name} -> {target:#x}; '
++                             'rebuild adapters without native-slide compensation')
++        source = layout.translate(stub + 4)
++        displacement = target - source
++        if displacement % 4 or not -(1 << 27) <= displacement < 1 << 27:
++            raise ValueError(f'Original branch out of range: {name}')
++        struct.pack_into('<I', data, source - layout.cache.base,
++                         0x14000000 | ((displacement >> 2) & 0x3ffffff))
++        result.append(dict(symbol=name[:-len('.original')], source=hex(source),
++                           target=hex(target), owner=owners[0]))
++    return result
++
++
++def relocate_native(data, layout):
++    """Apply exact linker records, retaining PAC metadata for the root chain writer."""
++    from kc_image import signed
++    native, base = layout.native, layout.cache.base
++    fixups = native.fixups()
++    pointers, counts, written = {}, Counter(), set()
++    for kind, si, so, ti, to in split_references(native):
++        source = layout.section_address(si, so)
++        target = layout.section_address(ti, to)
++        new_source = layout.section_address(si, so, True)
++        new_target = layout.section_address(ti, to, True)
++        width = 8 if kind in (2, 4, 13) else 4
++        at = new_source - base
++        original = int.from_bytes(native.read(source, width), 'little')
++        if source in written:
++            raise ValueError(f'Duplicate split-segment site {source:#x}')
++        written.add(source)
++        if kind in (2, 13):
++            record = fixups.get(source)
++            if record is None:
++                record = chained_pointer(native, source)
++            if record[0] != target:
++                raise ValueError(f'Split-segment pointer disagrees with fixup at {source:#x}')
++            pointers[new_source] = (new_target,) + record[1:]
++            counts['pointers'] += 1
++            continue
++        if kind in (3, 4):
++            value = signed(original, width * 8) + (new_target-target) - (new_source-source)
++            if not -(1 << (width*8-1)) <= value < 1 << (width*8-1):
++                raise ValueError(f'Relative value overflow at {source:#x}')
++            value &= (1 << (width*8)) - 1
++        elif kind == 5:
++            if original & 0x9f000000 != 0x90000000:
++                raise ValueError(f'Expected ADRP at {source:#x}')
++            previous = (source & ~4095) + (signed(((original >> 5) & 0x7ffff) << 2 |
++                                                  ((original >> 29) & 3), 21) << 12)
++            if previous != target & ~4095:
++                raise ValueError(f'ADRP target disagrees with linker at {source:#x}')
++            immediate = ((new_target & ~4095) - (new_source & ~4095)) >> 12
++            if not -(1 << 20) <= immediate < 1 << 20:
++                raise ValueError('Relocated ADRP out of range')
++            value = (original & 0x9f00001f) | (((immediate >> 2) & 0x7ffff) << 5) | ((immediate & 3) << 29)
++        elif kind == 6:
++            if original & 0xffc00000 == 0x91000000:
++                scale = 0
++            elif original & 0x3b000000 == 0x39000000:
++                scale = 4 if original & 0x04800000 == 0x04800000 else original >> 30
++            else:
++                raise ValueError(f'Expected ADD or load/store at {source:#x}')
++            low = new_target & 4095
++            if low % (1 << scale) or ((((original >> 10) & 4095) << scale) & 4095) != target & 4095:
++                raise ValueError(f'Page offset disagrees with linker at {source:#x}')
++            # Page-aligned segment moves preserve the low bits, including vector
++            # loads whose scaled immediate can exceed a page.
++            if (new_target - target) % PAGE:
++                raise ValueError('Split-segment move must preserve page offsets')
++            value = original
++        elif kind == 7:
++            if original & 0x7c000000 != 0x14000000 or source + signed(original & 0x3ffffff, 26)*4 != target:
++                raise ValueError(f'Branch disagrees with linker at {source:#x}')
++            displacement = new_target - new_source
++            if displacement % 4 or not -(1 << 27) <= displacement < 1 << 27:
++                raise ValueError('Relocated branch out of range')
++            value = (original & 0xfc000000) | ((displacement >> 2) & 0x3ffffff)
++        else:
++            raise ValueError(f'Unsupported native split-segment kind {kind}')
++        data[at:at + width] = value.to_bytes(width, 'little')
++        counts[f'kind_{kind}'] += 1
++    for site, pointer in fixups.items():
++        new_site = layout.translate(site)
++        if new_site not in pointers:
++            pointers[new_site] = (layout.translate(pointer[0]),) + pointer[1:]
++            counts['pointers_without_split_record'] += 1
++    return pointers, counts
+diff --git a/kits/NativePrelink/fileset_match.py b/kits/NativePrelink/fileset_match.py
+new file mode 100755
+index 0000000..c3e4206
+--- /dev/null
++++ b/kits/NativePrelink/fileset_match.py
+@@ -0,0 +1,1086 @@
++#!/usr/bin/env python3
++"""Pair functions and data of a stripped fileset kernel with a native kernel that has symbols."""
++import argparse
++from array import array
++from bisect import bisect_left, bisect_right
++from collections import Counter, defaultdict
++import hashlib
++import json
++import struct
++from pathlib import Path
++
++from kc_image import Image, scan
++from fileset_shape import checked_shape
++
++EXEC_SEGMENTS = ('__TEXT_EXEC', '__TEXT_BOOT_EXEC', '__KLD', '__LAST')
++MATCHER_VERSION = 8
++
++
++def matcher_signature():
++    """Invalidate cached maps when analysis code or reviewed evidence changes."""
++    root = Path(__file__).parent
++    digest = hashlib.sha256()
++    for path in [Path(__file__),root/'kc_image.py',root/'fileset_shape.py',*sorted((root/'fixtures').glob('fileset-*-symbols.json'))]:
++        digest.update(path.name.encode()+b'\0'+path.read_bytes())
++    return digest.hexdigest()
++
++
++def vtable_slots(side, base):
++    result = []
++    for offset in range(16, 8192, 8):
++        pointer = side.fixups.get(base + offset)
++        if not pointer or pointer[1:3] != (1, 0) or not side.in_exec(pointer[0]):
++            return result
++        result.append(pointer)
++    return []  # unterminated, so no proven table extent
++
++
++class Side:
++    """Functions, references and pointer fixups of one kernel."""
++
++    def __init__(self, image, fixups, mapped):
++        self.image = image
++        self.fixups = fixups
++        self.mapped = mapped
++        execs = [s for s in image.segments if s['name'] in EXEC_SEGMENTS and s['size']]
++        self.exec_ranges = [(s['va'], s['va'] + s['size']) for s in execs]
++        backed = [(s['va'], s['va'] + s['filesize']) for s in execs if s['filesize']]
++        starts = sorted(a for a in set(image.function_starts()) if self.in_exec(a))
++        self.starts = starts
++        self.checked_functions = {}
++        self.functions, self.callees, self.callers = {}, defaultdict(set), defaultdict(set)
++        for index, start in enumerate(starts):
++            end = min([e for b, e in self.exec_ranges if b <= start < e] +
++                      ([starts[index + 1]] if index + 1 < len(starts) else []))
++            for b, e in backed:
++                if b <= start < e:
++                    end = min(end, e)
++            if end - start < 4:
++                continue
++            calls, refs, shape = scan(image.read(start, end - start), start)
++            strings = {}
++            for site, address, _ in refs:
++                if not self.in_exec(address):
++                    text = image.cstring(address)
++                    if text is not None and len(text) >= 4:
++                        strings[site] = text
++            self.functions[start] = {
++                'end': end,
++                'refs': [(site - start, address) for site, address, _ in refs],
++                'length': len(shape),
++                'digest': hashlib.md5(array('I', shape)).hexdigest(),
++                'strings': strings,
++                'calls': [(site - start, target) for site, target, _ in calls],
++            }
++            checked, positions, _, _ = checked_shape(image.read(start, end - start), start)
++            self.checked_functions[start] = {
++                'digest': hashlib.md5(array('I', checked)).hexdigest(), 'length': len(checked),
++                'refs': [(positions[site-start], address) for site,address,_ in refs if site-start in positions],
++                'calls': [(positions[site-start], target) for site,target,_ in calls if site-start in positions],
++            }
++            for _, target, _ in calls:
++                if self.in_exec(target):
++                    at = bisect_right(starts, target) - 1
++                    if at >= 0:
++                        self.callees[start].add(starts[at])
++                        self.callers[starts[at]].add(start)
++        self.symbol_names = image.symbols()
++        self.symbol_addrs = sorted(self.symbol_names)
++        names = defaultdict(set)
++        for address, symbols in self.symbol_names.items():
++            if address in self.functions:
++                for name in symbols:
++                    names[name].add(address)
++        self.named_functions = {name: next(iter(addresses)) for name,addresses in names.items()
++                                if len(addresses) == 1}
++        self.string_owners = defaultdict(set)
++        for start, fn in self.functions.items():
++            for text in set(fn['strings'].values()):
++                self.string_owners[text].add(start)
++        self.diversity = defaultdict(set)
++        for _, (target, auth, _, diversity, _) in fixups.items():
++            if auth and diversity and self.in_mapped(target):
++                self.diversity[diversity].add(target)
++
++    def in_exec(self, address):
++        return any(b <= address < e for b, e in self.exec_ranges)
++
++    def in_mapped(self, address):
++        return any(b <= address < e for b, e in self.mapped)
++
++    def name_at(self, address):
++        names, addend = self.symbol_names.get(address), 0
++        if not names:
++            index = bisect_right(self.symbol_addrs, address) - 1
++            if index < 0:
++                return None, 0
++            base = self.symbol_addrs[index]
++            addend = address - base
++            if addend > 0x10000:
++                return None, 0
++            names = self.symbol_names[base]
++        return min(names), addend
++
++    def section_of(self, address):
++        section = self.image.section(address)
++        return f"{section['segment']},{section['name']}" if section else '?'
++
++
++class Matcher:
++    """Bind original functions to native functions; every bind must survive its checks."""
++
++    def __init__(self, original, native):
++        self.original, self.native = original, native
++        self.pairs, self.reverse, self.how = {}, {}, {}
++        self.conflicts = []
++
++    def bind(self, orig, native, how):
++        if self.pairs.get(orig) == native:
++            return False
++        if any('.cold.' in name for name in self.native.symbol_names.get(native, ())):
++            left, right = self.original.functions.get(orig), self.native.functions.get(native)
++            if left and right and left['digest'] != right['digest']:
++                return False
++        if orig in self.pairs or native in self.reverse and how not in ('vtable', 'reviewed', 'metaclass-getter'):
++            self.conflicts.append({'kind': 'double-bind', 'orig': f'{orig:#x}',
++                                   'native': f'{native:#x}', 'via': how})
++            return False
++        self.pairs[orig], self.how[orig] = native, how
++        self.reverse.setdefault(native, orig)
++        return True
++
++    PURE_LEAF_SKIP = {0xd503245f, 0xd503241f, 0xd503249f, 0xd50324df}  # BTI variants
++    PURE_LEAF_RET = {0xd65f03c0, 0xd65f0bff, 0xd65f0fff}               # RET, RETAA, RETAB
++
++    @classmethod
++    def pure_leaf(cls, side, start):
++        """The instructions of a function that only computes registers and returns, else None.
++
++        Such a body has no memory access, call or branch, so any function with the same
++        instructions behaves the same; its identity does not matter.
++        """
++        fn = side.functions.get(start)
++        if fn is None:
++            return None
++        count = (fn['end'] - start) // 4
++        words = [w for w in struct.unpack(f'<{count}I', side.image.read(start, count * 4))
++                 if w not in cls.PURE_LEAF_SKIP]
++        for index, word in enumerate(words[:8]):
++            if word in cls.PURE_LEAF_RET:
++                return tuple(words[:index + 1])
++            if (word >> 25) & 0xf not in (0b1000, 0b1001, 0b0101, 0b1101):
++                return None  # not data processing on registers
++        return None
++
++    def pair_pure_leaves(self, targets):
++        """Bind each unpaired kext-facing pure leaf to an unused native function with the same instructions."""
++        pool = defaultdict(list)
++        for start in sorted(self.native.functions):
++            body = self.pure_leaf(self.native, start)
++            if body is not None and start not in self.reverse:
++                pool[body].append(start)
++        bound = 0
++        for orig in sorted(targets):
++            if orig in self.pairs or orig not in self.original.functions:
++                continue
++            body = self.pure_leaf(self.original, orig)
++            if body is not None and pool.get(body):
++                bound += self.bind(orig, pool[body].pop(0), 'pure-leaf')
++        return bound
++
++    def canon(self, native_start):
++        # Local symbols and LLVM outlined names can repeat across object files.
++        # Two such names are not one call-graph node.
++        return native_start
++
++    def anchor_reference(self, reference, pairing):
++        """Transfer identities from unique code matches through unique symbols.
++
++        The additional image is only a naming reference. Final addresses always
++        come from the actual native kernel; graph/string guesses do not transfer.
++        """
++        accepted = {'shape', 'pac-checked-shape', 'reference-shape', 'reviewed'}
++        bound = 0
++        for key, value in pairing['functions'].items():
++            if value['how'] not in accepted:
++                continue
++            orig, ref = int(key,16), int(value['native'],16)
++            names = [name for name in reference.symbol_names.get(ref, ())
++                     if reference.named_functions.get(name) == ref and
++                     not any(part in name for part in ('.cold.', 'OUTLINED_FUNCTION', '.llvm.'))]
++            targets = {self.native.named_functions[name] for name in names
++                       if name in self.native.named_functions}
++            if len(targets) == 1:
++                bound += self.bind(orig, next(iter(targets)), 'reference-symbol')
++        return bound
++
++    def anchor_reference_order(self, reference, pairing, rounds=4):
++        """Fill gaps between ordered reference pairs, then transfer names like anchor_reference.
++
++        The release reference keeps the original's function order (one object
++        file after another), so unpaired functions between two consecutive
++        pairs line up in order when their lengths agree.
++        """
++        pairs = {int(k, 16): int(v['native'], 16) for k, v in pairing['functions'].items()}
++        for _ in range(rounds):
++            reverse = {v: k for k, v in pairs.items()}
++            anchors = sorted(pairs)
++            added = {}
++            for left, right in zip(anchors, anchors[1:]):
++                if pairs[right] <= pairs[left]:
++                    continue
++                a, b = bisect_right(self.original.starts, left), bisect_left(self.original.starts, right)
++                gap = [o for o in self.original.starts[a:b] if o not in pairs and o in self.original.functions]
++                a, b = bisect_right(reference.starts, pairs[left]), bisect_left(reference.starts, pairs[right])
++                fill = [n for n in reference.starts[a:b] if n not in reverse and n in reference.functions]
++                if not gap or not fill or len(gap) * len(fill) > 40000:
++                    continue
++                lengths = [self.original.functions[o]['length'] for o in gap], [reference.functions[n]['length'] for n in fill]
++                close = lambda i, j: abs(lengths[0][i] - lengths[1][j]) <= max(2, max(lengths[0][i], lengths[1][j]) // 10)
++                if len(gap) == len(fill):
++                    added.update((gap[i], (fill[i], True)) for i in range(len(gap)) if close(i, i))
++                    continue
++                table = [[0] * (len(fill) + 1) for _ in range(len(gap) + 1)]
++                for i in range(len(gap) - 1, -1, -1):
++                    for j in range(len(fill) - 1, -1, -1):
++                        table[i][j] = table[i + 1][j + 1] + 1 if close(i, j) else max(table[i + 1][j], table[i][j + 1])
++                i = j = 0
++                while i < len(gap) and j < len(fill):
++                    if close(i, j) and table[i][j] == table[i + 1][j + 1] + 1:
++                        added[gap[i]] = (fill[j], False)
++                        i += 1
++                        j += 1
++                    elif table[i + 1][j] >= table[i][j + 1]:
++                        i += 1
++                    else:
++                        j += 1
++            # Order alone is not proof: calls into paired functions must agree with the reference,
++            # and a function without such calls needs a near-identical length.
++            # In a gap of unequal counts, a length match alone is not enough.
++            checked = {}
++            for orig, (ref, equal) in added.items():
++                agree = sum(1 for t in self.original.callees[orig] if t in pairs and pairs[t] in reference.callees[ref])
++                miss = sum(1 for t in self.original.callees[orig] if t in pairs and pairs[t] not in reference.callees[ref])
++                exact = abs(self.original.functions[orig]['length'] - reference.functions[ref]['length']) <= 2
++                texts = set(self.original.functions[orig]['strings'].values()), set(reference.functions[ref]['strings'].values())
++                if texts[0] and texts[1] and texts[0] != texts[1]:
++                    continue
++                if (agree and miss * 4 <= agree) or (equal and not agree and not miss and exact) or \
++                        (texts[0] and texts[0] == texts[1] and not miss):
++                    checked[orig] = ref
++            if not checked:
++                break
++            pairs.update(checked)
++        # A pair is kept when it sits in order between its neighbors; out-of-order pairs are the
++        # ones layout or a wrong match moved.
++        anchors = sorted(pairs)
++        monotone = {anchors[i] for i in range(1, len(anchors) - 1)
++                    if pairs[anchors[i - 1]] < pairs[anchors[i]] < pairs[anchors[i + 1]]}
++        bound = 0
++        for orig, ref in pairs.items():
++            if orig in self.pairs or orig not in monotone:
++                continue
++            names = [name for name in reference.symbol_names.get(ref, ())
++                     if reference.named_functions.get(name) == ref and
++                     not any(part in name for part in ('.cold.', 'OUTLINED_FUNCTION', '.llvm.'))]
++            targets = {self.native.named_functions[name] for name in names if name in self.native.named_functions}
++            if len(targets) == 1:
++                bound += self.bind(orig, next(iter(targets)), 'reference-order')
++        return bound
++
++    def reference_data(self, reference, pairing, targets, known):
++        """Name data targets through the reference: paired data, or a fixed offset from the
++        nearest paired object of the same section that lands on a reference symbol."""
++        pairs = {int(k, 16): int(v['native'], 16) for k, v in pairing['data'].items()}
++        anchors = sorted(pairs)
++        natives = defaultdict(set)
++        for address, names in self.native.symbol_names.items():
++            if not self.native.in_exec(address):
++                for name in names:
++                    natives[name].add(address)
++        added = 0
++        for target in sorted(targets):
++            if target in known or self.original.in_exec(target):
++                continue
++            ref = pairs.get(target)
++            if ref is None:
++                index = bisect_right(anchors, target) - 1
++                if index < 0 or target - anchors[index] > 0x10000:
++                    continue
++                low = anchors[index]
++                if self.original.section_of(low) != self.original.section_of(target):
++                    continue
++                ref = pairs[low] + target - low
++                if index + 1 < len(anchors) and anchors[index + 1] - target < 0x10000 and \
++                        pairs[anchors[index + 1]] - ref != anchors[index + 1] - target:
++                    continue
++            if reference.section_of(ref).split(',')[1] != self.original.section_of(target).split(',')[1]:
++                continue
++            name, addend = reference.name_at(ref)
++            if name is None or addend not in (0, 16) or (addend and not name.startswith('__ZTV')):
++                continue
++            if reference.symbol_names.get(ref - addend, ()) and len(natives.get(name, ())) == 1:
++                known[target] = (next(iter(natives[name])) + addend, 'reference-data')
++                added += 1
++        return added
++
++    def reviewed_records(self, inputs):
++        """Reviewed identities are pinned to the original kernelcache; the native side is named by symbol,
++        so a rebuilt native kernel keeps them."""
++        for path in sorted((Path(__file__).parent / 'fixtures').glob('fileset-*-symbols.json')):
++            record = json.loads(path.read_text())
++            pinned = record['inputs']
++            if (pinned['kernelcache_sha256'], pinned['entry']) == (inputs['kernelcache_sha256'], inputs['entry']):
++                yield record
++
++    def pair_data_slots(self, targets, known):
++        """A constant pointer slot (Class::metaClass, kOSBooleanTrue) is named by the object it points to."""
++        pointed = defaultdict(set)
++        for site, (target, *_rest) in self.native.fixups.items():
++            if not self.native.in_exec(site) and self.native.symbol_names.get(site):
++                pointed[target].add(site)
++        objects = {address: native for address, (native, _) in known.items()}
++        added = 0
++        for target in sorted(targets):
++            if target in known or self.original.in_exec(target):
++                continue
++            fix = self.original.fixups.get(target)
++            if not fix:
++                continue
++            native_object = self.pairs.get(fix[0]) if self.original.in_exec(fix[0]) else objects.get(fix[0])
++            slots = pointed.get(native_object, set())
++            if len(slots) == 1:
++                known[target] = (next(iter(slots)), 'slot')
++                added += 1
++        return added
++
++    def pair_sysctl_variables(self, targets, known):
++        """A sysctl OID names its variable: oid_name (+0x30) is a string, oid_arg1 (+0x20) the variable."""
++        def variables(side):
++            found = defaultdict(set)
++            image = side.image
++            for site, (target, *_rest) in side.fixups.items():
++                arg = side.fixups.get(site - 0x10)
++                if not arg or side.in_exec(arg[0]) or not side.in_mapped(site):
++                    continue
++                try:
++                    raw = image.read(target, 64)
++                except ValueError:
++                    continue
++                name = raw.split(b'\0', 1)[0]
++                if 3 <= len(name) < 64 and b'\0' in raw and all(48 <= b < 123 or b == 95 for b in name):
++                    found[name].add(arg[0])
++            return found
++        original, native = variables(self.original), variables(self.native)
++        added = 0
++        # SYSCTL_NODE anchors "__anchor__(_parent_name)" hang off their node's children list (oid_parent, +0).
++        symbols = {name: address for address, names in self.native.symbol_names.items() for name in names}
++        for site, (target, *_rest) in self.original.fixups.items():
++            parent = self.original.fixups.get(site - 0x28)
++            if not parent or parent[0] not in targets or parent[0] in known:
++                continue
++            try:
++                name = self.original.image.read(target, 80).split(b'\0', 1)[0]
++            except ValueError:
++                continue
++            if name.startswith(b'__anchor__(') and name.endswith(b')'):
++                children = symbols.get(f'_sysctl_{name[11:-1].decode()}_children')
++                if children is not None:
++                    known[parent[0]] = (children, 'sysctl')
++                    added += 1
++        for name, addresses in original.items():
++            if len(addresses) != 1 or len(native.get(name, ())) != 1:
++                continue
++            address = next(iter(addresses))
++            if address in targets and address not in known:
++                known[address] = (next(iter(native[name])), 'sysctl')
++                added += 1
++        return added
++
++    def pair_data_fields(self, targets, known):
++        """Paired constant objects have equal layouts: pointers at equal offsets name each other."""
++        votes = defaultdict(Counter)
++        for orig, (native, _) in list(known.items()):
++            for offset in range(0, 0x100, 8):
++                left, right = self.original.fixups.get(orig + offset), self.native.fixups.get(native + offset)
++                if left and right and left[0] in targets and left[0] not in known and \
++                        not self.original.in_exec(left[0]) and not self.native.in_exec(right[0]):
++                    votes[left[0]][right[0]] += 1
++        added = 0
++        for target, counter in votes.items():
++            (best, count), = counter.most_common(1)
++            if count >= 2 and count * 4 >= sum(counter.values()) * 3:
++                known[target] = (best, 'fields')
++                added += 1
++        return added
++
++    def pair_data_by_users(self, targets, known):
++        """Every paired function that references a data target references its native counterpart."""
++        users = defaultdict(set)
++        for orig, fn in self.original.functions.items():
++            if orig in self.pairs:
++                for _, address in fn['refs']:
++                    users[address].add(orig)
++        added = 0
++        for target in sorted(targets):
++            if target in known or self.original.in_exec(target) or not users.get(target):
++                continue
++            section = self.original.section_of(target).split(',')[-1]
++            candidates = None
++            for orig in users[target]:
++                refs = {address for _, address in self.native.functions[self.pairs[orig]]['refs']
++                        if not self.native.in_exec(address) and self.native.section_of(address).split(',')[-1] == section}
++                candidates = refs if candidates is None else candidates & refs
++            if candidates and len(candidates) == 1 and len(users[target]) >= 2:
++                known[target] = (next(iter(candidates)), 'users')
++                added += 1
++        return added
++
++    def anchor_reviewed(self, inputs):
++        """Load individually reviewed ABI identities for the exactly pinned original image."""
++        added = 0
++        for record in self.reviewed_records(inputs):
++            for entry in record['functions']:
++                if not entry.get('evidence'):
++                    raise ValueError('Reviewed function requires recorded evidence')
++                orig = int(entry['original'],16)
++                if orig not in self.original.functions:
++                    raise ValueError(f'Reviewed function is absent: {entry["original"]}')
++                fn = self.original.functions[orig]
++                if hashlib.sha256(self.original.image.read(orig, fn['end'] - orig)).hexdigest() != entry['original_sha256']:
++                    raise ValueError(f'Reviewed function bytes changed: {entry["original"]}')
++                native = self.native.named_functions.get(entry['native_symbol'])
++                if native is not None:
++                    added += self.bind(orig, native, 'reviewed')
++        return added
++
++    def reviewed_data(self, inputs, known):
++        """Reviewed data identities: original address -> native symbol plus addend."""
++        names = defaultdict(set)
++        for address, symbols in self.native.symbol_names.items():
++            for name in symbols:
++                names[name].add(address)
++        added = 0
++        for record in self.reviewed_records(inputs):
++            for entry in record.get('data', []):
++                if not entry.get('evidence'):
++                    raise ValueError('Reviewed data requires recorded evidence')
++                found = names.get(entry['native_symbol'], ())
++                if len(found) == 1:
++                    known[int(entry['original'], 16)] = (next(iter(found)) + entry.get('addend', 0), 'reviewed')
++                    added += 1
++        return added
++
++    def anchor_strings(self):
++        """Unique string references anchor the first pairs."""
++        votes = defaultdict(Counter)
++        for text, owners in self.original.string_owners.items():
++            targets = self.native.string_owners.get(text)
++            if targets and len(owners) == 1 and len(targets) == 1:
++                orig, target = next(iter(owners)), next(iter(targets))
++                # LLVM may outline the panic path into foo.cold.N in only one
++                # build. A string in that path identifies foo, not an ABI-callable
++                # replacement for foo. Equal-shaped outlined functions can still
++                # match directly; otherwise require the named parent to call it.
++                left, right = self.original.functions[orig], self.native.functions[target]
++                if left['digest'] != right['digest']:
++                    parents = {self.native.named_functions.get(name.split('.cold.')[0])
++                               for name in self.native.symbol_names.get(target, ()) if '.cold.' in name}
++                    parents.discard(None)
++                    if parents:
++                        if len(parents) != 1:
++                            continue
++                        parent = next(iter(parents))
++                        if target not in self.native.callees[parent]:
++                            continue
++                        target = parent
++                votes[orig][target] += 1
++        claimed = Counter(n for counter in votes.values() for n in counter)
++        bound = 0
++        for orig, counter in votes.items():
++            if len(counter) == 1:
++                native = next(iter(counter))
++                if claimed[native] == 1:
++                    bound += self.bind(orig, native, 'string')
++        return bound
++
++    def anchor_shapes(self):
++        """A relocation-masked instruction sequence owned by exactly one function per side."""
++        groups = defaultdict(lambda: ([], []))
++        for orig, fn in self.original.functions.items():
++            groups[(fn['digest'], fn['length'])][0].append(orig)
++        for native, fn in self.native.functions.items():
++            groups[(fn['digest'], fn['length'])][1].append(native)
++        bound = 0
++        for originals, natives in groups.values():
++            if len(originals) == 1 and len(natives) == 1:
++                bound += self.bind(originals[0], natives[0], 'shape')
++        return bound
++
++    def anchor_checked_shapes(self):
++        """Match unique bodies while accounting for explicit compiler PAC checks."""
++        groups = defaultdict(lambda: ([], []))
++        for index, side in enumerate((self.original, self.native)):
++            for address, fn in side.checked_functions.items():
++                groups[fn['digest'], fn['length']][index].append(address)
++        return sum(self.bind(a[0], b[0], 'pac-checked-shape')
++                   for a,b in groups.values() if len(a) == len(b) == 1)
++
++    def comparable_functions(self, orig, native):
++        left, right = self.original.functions[orig], self.native.functions[native]
++        if left['digest'] != right['digest']:
++            left = getattr(self.original, 'checked_functions', {}).get(orig, left)
++            right = getattr(self.native, 'checked_functions', {}).get(native, right)
++        return left, right
++
++
++    def propagate(self):
++        """Match unmatched functions by their set of already matched neighbor names."""
++        index = defaultdict(list)
++        for native in self.native.functions:
++            if native not in self.reverse:
++                out = frozenset(self.canon(n) for n in self.native.callees[native] if n in self.reverse)
++                incoming = frozenset(self.canon(n) for n in self.native.callers[native] if n in self.reverse)
++                index[out,incoming].append(native)
++        proposals, claimed = [], Counter()
++        for orig in self.original.functions:
++            if orig in self.pairs:
++                continue
++            out = frozenset(self.canon(self.pairs[t]) for t in self.original.callees[orig] if t in self.pairs)
++            incoming = frozenset(self.canon(self.pairs[t]) for t in self.original.callers[orig] if t in self.pairs)
++            if len(out | incoming) < 2:
++                continue
++            candidates = index.get((out,incoming), [])
++            if len(candidates) > 1:
++                digest = self.original.functions[orig]['digest']
++                candidates = [n for n in candidates if self.native.functions[n]['digest'] == digest]
++            if len(candidates) == 1:
++                proposals.append((orig, candidates[0]))
++                claimed[candidates[0]] += 1
++        bound = 0
++        for orig, native in proposals:
++            if claimed[native] == 1:
++                bound += self.bind(orig, native, 'calls')
++        return bound
++
++    def validate_calls(self):
++        """Inlining differs between builds; unbind only when many matched edges disagree."""
++        bad = []
++        for orig, native in self.pairs.items():
++            out_missing = sum(1 for t in self.original.callees[orig]
++                              if t in self.pairs and self.pairs[t] not in self.native.callees[native])
++            in_missing = sum(1 for n in self.native.callees[native]
++                             if n in self.reverse and self.reverse[n] not in self.original.callees[orig])
++            agree = sum(1 for t in self.original.callees[orig]
++                        if t in self.pairs and self.pairs[t] in self.native.callees[native])
++            if out_missing + in_missing > max(2, (agree + out_missing + in_missing) // 4):
++                bad.append(orig)
++        for orig in bad:
++            self.conflicts.append({'kind': 'call-edge', 'orig': f'{orig:#x}',
++                                   'native': f'{self.pairs[orig]:#x}', 'via': self.how[orig]})
++            del self.reverse[self.pairs.pop(orig)]
++            del self.how[orig]
++        return len(bad)
++
++    def align_orders(self):
++        """Between matched anchors, equal shapes in the same order bind non-unique functions."""
++        bound = sorted(self.pairs)
++        added = 0
++        for left, right in zip(bound, bound[1:]):
++            if self.pairs[right] <= self.pairs[left]:
++                continue
++            a, b = bisect_right(self.original.starts, left), bisect_left(self.original.starts, right)
++            gap = [o for o in self.original.starts[a:b] if o not in self.pairs]
++            a = bisect_right(self.native.starts, self.pairs[left])
++            b = bisect_left(self.native.starts, self.pairs[right])
++            fill = [n for n in self.native.starts[a:b] if n not in self.reverse]
++            if not gap or not fill:
++                continue
++            original = self.original.functions
++            native = self.native.functions
++            # Longest common subsequence over relocation-masked shapes.
++            table = [[0] * (len(fill) + 1) for _ in range(len(gap) + 1)]
++            for i in range(len(gap) - 1, -1, -1):
++                for j in range(len(fill) - 1, -1, -1):
++                    if original[gap[i]]['digest'] == native[fill[j]]['digest']:
++                        table[i][j] = table[i + 1][j + 1] + 1
++                    else:
++                        table[i][j] = max(table[i + 1][j], table[i][j + 1])
++            i = j = 0
++            while i < len(gap) and j < len(fill):
++                if original[gap[i]]['digest'] == native[fill[j]]['digest']:
++                    added += self.bind(gap[i], fill[j], 'order')
++                    i += 1
++                    j += 1
++                elif table[i + 1][j] >= table[i][j + 1]:
++                    i += 1
++                else:
++                    j += 1
++        return added
++
++    def validate_diversity(self):
++        """A pointer diversity is a name hash: a bound pair must not contradict it."""
++        bad = []
++        for diversity, originals in self.original.diversity.items():
++            natives = self.native.diversity.get(diversity)
++            if not natives:
++                continue
++            for orig in originals:
++                native = self.pairs.get(orig)
++                if native is not None and native not in natives:
++                    bad.append(orig)
++        for orig in sorted(set(bad)):
++            if orig not in self.pairs:
++                continue
++            self.conflicts.append({'kind': 'diversity', 'orig': f'{orig:#x}',
++                                   'native': f'{self.pairs[orig]:#x}', 'via': self.how[orig]})
++            del self.reverse[self.pairs.pop(orig)]
++            del self.how[orig]
++        return len(bad)
++
++    def pair_data(self, known):
++        """Identical functions reference their data at identical instruction offsets."""
++        votes = defaultdict(Counter)
++        for orig, native in self.pairs.items():
++            left, right = self.comparable_functions(orig, native)
++            if left['digest'] != right['digest'] or len(left['refs']) != len(right['refs']):
++                continue
++            for (offset, address), (native_offset, native_address) in zip(left['refs'], right['refs']):
++                if offset != native_offset:
++                    break
++                if not self.original.in_exec(address) and not self.native.in_exec(native_address) and \
++                        self.original.in_mapped(address) and self.native.in_mapped(native_address):
++                    votes[address][native_address] += 1
++        split = 0
++        for address, counter in votes.items():
++            if address in known:
++                continue
++            if len(counter) == 1:
++                known[address] = (next(iter(counter)), 'refs')
++            else:
++                split += 1
++        return split
++
++    def pair_calls(self):
++        """Use corresponding call sites in already paired, equal-shaped functions."""
++        votes = defaultdict(set)
++        for orig, native in self.pairs.items():
++            left, right = self.comparable_functions(orig, native)
++            if not left or not right or left['digest'] != right['digest'] or left['length'] != right['length']:
++                continue
++            if len(left['calls']) != len(right['calls']):
++                continue
++            for (offset, target), (native_offset, native_target) in zip(left['calls'], right['calls']):
++                if offset != native_offset:
++                    break
++                if target in self.original.functions and native_target in self.native.functions:
++                    votes[target].add(native_target)
++        return sum(self.bind(orig, next(iter(targets)), 'call-sites')
++                   for orig, targets in votes.items() if len(targets) == 1)
++
++    def pair_data_users(self, known):
++        """Two identified data objects jointly identify their unique function user.
++
++        Include already-bound functions in the candidate index: removing them
++        first would turn an ambiguous data signature into a false unique match.
++        """
++        users = defaultdict(set)
++        for native, fn in self.native.functions.items():
++            for _, address in fn['refs']:
++                users[address].add(native)
++        proposals, claimed = [], Counter()
++        for orig, fn in self.original.functions.items():
++            if orig in self.pairs:
++                continue
++            anchors = {known[address][0] for _, address in fn['refs'] if address in known}
++            if len(anchors) < 2:
++                continue
++            candidates = set.intersection(*(users[address] for address in anchors))
++            calls = {self.pairs[target] for target in self.original.callees[orig]
++                     if target in self.pairs and target != orig}
++            if len(candidates) > 1 and calls:
++                candidates = {n for n in candidates if calls <= self.native.callees[n]}
++            if len(candidates) == 1:
++                native = next(iter(candidates))
++                proposals.append((orig, native))
++                claimed[native] += 1
++        return sum(self.bind(orig, native, 'data-users') for orig, native in proposals if claimed[native] == 1)
++
++    def pair_reference_shapes(self, known):
++        """Disambiguate equal-shaped methods by every data operand and call site."""
++        shapes = defaultdict(list)
++        for n, fn in self.native.functions.items():
++            shapes[fn['digest'],fn['length']].append(n)
++        proposals, claimed = [], Counter()
++        for o,left in self.original.functions.items():
++            if o in self.pairs or not any(a in known for _,a in left['refs']):
++                continue
++            candidates = []
++            for n in shapes[left['digest'],left['length']]:
++                right = self.native.functions[n]
++                if len(left['refs']) != len(right['refs']) or len(left['calls']) != len(right['calls']):
++                    continue
++                valid = True
++                for (site,address),(other,target) in zip(left['refs'],right['refs']):
++                    if site != other:
++                        valid = False; break
++                    if address in known:
++                        if known[address][0] != target:
++                            valid = False; break
++                    else:
++                        string = self.original.image.cstring(address)
++                        if string is None or string != self.native.image.cstring(target):
++                            valid = False; break
++                if not valid:
++                    continue
++                for (site,address),(other,target) in zip(left['calls'],right['calls']):
++                    if site != other:
++                        valid = False; break
++                    if o <= address < left['end']:
++                        if target-n != address-o:
++                            valid = False; break
++                    elif self.pairs.get(address) != target:
++                        valid = False; break
++                if valid:
++                    candidates.append(n)
++            if len(candidates) == 1:
++                proposals.append((o,candidates[0]));claimed[candidates[0]] += 1
++        return sum(self.bind(o,n,'reference-shape') for o,n in proposals if claimed[n] == 1)
++
++    def diversity_data(self, known):
++        """A diversity held by one target per side names that target; binds functions and data."""
++        collisions = 0
++        for diversity, originals in self.original.diversity.items():
++            natives = self.native.diversity.get(diversity)
++            if not natives:
++                continue
++            if len(originals) != 1 or len(natives) != 1:
++                collisions += 1
++                continue
++            orig, native = next(iter(originals)), next(iter(natives))
++            if self.original.in_exec(orig) and self.native.in_exec(native):
++                self.bind(orig, native, 'diversity')
++            elif orig not in known and not self.original.in_exec(orig) and not self.native.in_exec(native):
++                known[orig] = (native, 'diversity')
++        return collisions
++
++    def anchor_vtables(self, known):
++        """Match slots only within an identified table with the same complete PAC layout.
++
++        A discriminator alone identifies a virtual slot, not its implementation.
++        Table identity comes from paired data references; native symbols delimit
++        the table start. Stop at the first non-function pointer, before padding
++        and the following object. Never extend to the next symbol through a gap.
++        """
++        votes = defaultdict(set)
++        identified = set()
++        for orig, (native, how) in known.items():
++            if how not in ('refs', 'vtable-layout', 'vtable-user', 'metaclass-vtable') or not any(name.startswith('__ZTV')
++                                       for name in self.native.symbol_names.get(native, ())):
++                continue
++            if self.original.image.read(orig, 16) != bytes(16) or self.native.image.read(native, 16) != bytes(16):
++                continue
++            left, right = vtable_slots(self.original, orig), vtable_slots(self.native, native)
++            if len(left) < 2 or len(left) != len(right) or any(a[1:] != b[1:] for a, b in zip(left, right)):
++                continue
++            for a, b in zip(left, right):
++                votes[a[0]].add(b[0])
++                if how in ('metaclass-vtable','vtable-user'):
++                    identified.add(a[0])
++        added = 0
++        for orig, targets in votes.items():
++            if len(targets) == 1:
++                native = next(iter(targets))
++                if orig in identified and self.pairs.get(orig) not in (None,native):
++                    if self.how[orig] == 'reviewed':
++                        raise ValueError(f'Class vtable contradicts reviewed identity at {orig:#x}')
++                    old = self.pairs.pop(orig)
++                    self.conflicts.append({'kind':'vtable-correction','orig':hex(orig),
++                                           'previous':hex(old),'native':hex(native),'via':self.how.pop(orig)})
++                    if self.reverse.get(old) == orig:
++                        self.reverse.pop(old)
++                        other = next((o for o,n in self.pairs.items() if n == old),None)
++                        if other is not None:
++                            self.reverse[old] = other
++                added += self.bind(orig, native, 'vtable')
++        return added
++
++    def pair_vtables(self, known):
++        """Find a table using at least two distinct bound methods and all PAC slots."""
++        uses = defaultdict(set)
++        for site, pointer in self.original.fixups.items():
++            if pointer[1:3] == (1, 0) and self.original.in_mapped(site):
++                uses[pointer[0]].add(site)
++        claimed = {native for native, _ in known.values()}
++        added = 0
++        for native, names in self.native.symbol_names.items():
++            if native in claimed or not any(name.startswith('__ZTV') for name in names):
++                continue
++            right = vtable_slots(self.native, native)
++            anchors = [(index * 8 + 16, self.reverse[pointer[0]]) for index, pointer in enumerate(right)
++                       if pointer[0] in self.reverse and
++                       self.how[self.reverse[pointer[0]]] not in ('identical-leaf', 'thunk')]
++            if len({orig for _, orig in anchors}) < 2:
++                continue
++            candidates = None
++            for offset, orig in sorted(anchors, key=lambda row: len(uses[row[1]])):
++                locations = {site - offset for site in uses[orig]}
++                candidates = locations if candidates is None else candidates & locations
++                if not candidates:
++                    break
++            qualified = []
++            for orig in candidates or ():
++                if orig in known or not self.original.in_mapped(orig):
++                    continue
++                try:
++                    if self.original.image.read(orig, 16) != bytes(16):
++                        continue
++                except ValueError:
++                    continue
++                left = vtable_slots(self.original, orig)
++                if len(left) != len(right) or any(a[1:] != b[1:] for a, b in zip(left, right)):
++                    continue
++                def disagrees(a, b):
++                    target = self.pairs.get(a[0])
++                    if target is None or target == b[0]:
++                        return False
++                    if self.how[a[0]] == 'identical-leaf':
++                        first, second = self.native.functions.get(target), self.native.functions.get(b[0])
++                        if first and second:
++                            return self.native.image.read(target, first['end']-target) != \
++                                self.native.image.read(b[0], second['end']-b[0])
++                    return True
++                if any(disagrees(a, b) for a, b in zip(left, right)):
++                    continue
++                qualified.append(orig)
++            if len(qualified) == 1:
++                known[qualified[0]] = (native, 'vtable-layout')
++                added += 1
++        return added
++
++    def pair_vtable_users(self, known):
++        """An identified class method can identify its own complete vtable.
++
++        This covers MetaClass::alloc and initialize routines whose bodies differ
++        because of inlining. Require the class name in the native method symbol,
++        one matching table in each function, and equal complete PAC layouts.
++        """
++        votes = defaultdict(set)
++        for orig,native in self.pairs.items():
++            if self.how[orig] not in ('string','vtable','reviewed','reference-shape'):
++                continue
++            left,right = self.original.functions.get(orig),self.native.functions.get(native)
++            if not left or not right:
++                continue
++            native_tables = {}
++            for _,address in right['refs']:
++                names = [n for n in self.native.symbol_names.get(address,()) if n.startswith('__ZTV')]
++                if not names:
++                    continue
++                if not any(name[5:] in method for name in names
++                           for method in self.native.symbol_names.get(native,())):
++                    continue
++                slots = vtable_slots(self.native,address)
++                if len(slots) >= 2:
++                    native_tables[address] = tuple(p[1:] for p in slots)
++            original_tables = {}
++            for _,address in left['refs']:
++                if not self.original.in_mapped(address):
++                    continue
++                try:
++                    if self.original.image.read(address,16) != bytes(16):
++                        continue
++                except ValueError:
++                    continue
++                slots = vtable_slots(self.original,address)
++                if len(slots) >= 2:
++                    original_tables[address] = tuple(p[1:] for p in slots)
++            for address,signature in native_tables.items():
++                candidates = [a for a,s in original_tables.items() if s == signature]
++                if len(candidates) == 1 and sum(s == signature for s in native_tables.values()) == 1:
++                    votes[candidates[0]].add(address)
++        added = 0
++        for orig,targets in votes.items():
++            if orig not in known and len(targets) == 1:
++                known[orig] = (next(iter(targets)),'vtable-user')
++                added += 1
++        return added
++
++    def pair_metaclass_vtables(self, known):
++        """The class-specific getMetaClass pointer identifies a complete table."""
++        uses = defaultdict(set)
++        for site,pointer in self.original.fixups.items():
++            if pointer[1:3] == (1,0) and self.original.in_mapped(site):
++                uses[pointer[0]].add(site)
++        added = 0
++        for native,names in self.native.symbol_names.items():
++            table_names = [name[5:] for name in names if name.startswith('__ZTV')]
++            if not table_names:
++                continue
++            right = vtable_slots(self.native,native)
++            for index,pointer in enumerate(right):
++                method = pointer[0]
++                if not any('12getMetaClassEv' in name and any(cls in name for cls in table_names)
++                           for name in self.native.symbol_names.get(method,())):
++                    continue
++                originals = [o for o,n in self.pairs.items() if n == method and
++                             self.how[o] in ('reference-shape','shape','vtable','reviewed','metaclass-getter')]
++                for orig_method in originals:
++                    left_fn,right_fn = self.original.functions[orig_method],self.native.functions[method]
++                    if left_fn['digest'] != right_fn['digest'] or len(left_fn['refs']) != 1 or len(right_fn['refs']) != 1:
++                        continue
++                    original_meta,native_meta = left_fn['refs'][0][1],right_fn['refs'][0][1]
++                    if known.get(original_meta,(None,))[0] != native_meta:
++                        continue
++                    if not any('10gMetaClassE' in name and any(cls in name for cls in table_names)
++                               for name in self.native.symbol_names.get(native_meta,())):
++                        continue
++                    for site in uses[orig_method]:
++                        orig = site-16-index*8
++                        if orig in known:
++                            continue
++                        try:
++                            if self.original.image.read(orig,16) != bytes(16):
++                                continue
++                        except ValueError:
++                            continue
++                        left = vtable_slots(self.original,orig)
++                        if len(left) == len(right) and all(a[1:] == b[1:] for a,b in zip(left,right)):
++                            known[orig] = (native,'metaclass-vtable');added += 1
++        return added
++
++    def pair_metaclass_getters(self, known):
++        """Identify getMetaClass by its sole known metaobject and exact code shape."""
++        getters = defaultdict(set)
++        for n,fn in self.native.functions.items():
++            if fn['calls'] or len(fn['refs']) != 1:
++                continue
++            names = [name for name in self.native.symbol_names.get(n,()) if name.endswith('12getMetaClassEv')]
++            address = fn['refs'][0][1]
++            if not names or not any(name.endswith('10gMetaClassE') for name in self.native.symbol_names.get(address,())):
++                continue
++            getters[address,fn['digest'],fn['length']].add(n)
++        added = 0
++        for o,fn in self.original.functions.items():
++            if o in self.pairs or fn['calls'] or len(fn['refs']) != 1:
++                continue
++            target = known.get(fn['refs'][0][1],(None,))[0]
++            candidates = getters.get((target,fn['digest'],fn['length']),())
++            if len(candidates) == 1:
++                added += self.bind(o,next(iter(candidates)),'metaclass-getter')
++        return added
++
++    def report(self, data):
++        functions = {}
++        for orig in sorted(self.pairs):
++            native = self.pairs[orig]
++            name, addend = self.native.name_at(native)
++            functions[f'{orig:#x}'] = {'native': f'{native:#x}', 'name': name, 'addend': addend,
++                                       'how': self.how[orig]}
++        payload = {
++            'matcher_version': MATCHER_VERSION,
++            'matcher_signature': matcher_signature(),
++            'functions': functions,
++            'data': {f'{orig:#x}': {'native': f'{native:#x}', 'name': self.native.name_at(native)[0],
++                                    'how': how, 'sections': [self.original.section_of(orig),
++                                                             self.native.section_of(native)]}
++                     for orig, (native, how) in sorted(data.items())},
++            'stats': {
++                'functions_original': len(self.original.functions),
++                'functions_native': len(self.native.functions),
++                'functions_matched': len(self.pairs),
++                'functions_by_method': dict(Counter(self.how.values())),
++                'data_matched': len(data),
++                'data_by_method': dict(Counter(how for _, how in data.values())),
++                'conflicts': dict(Counter(c['kind'] for c in self.conflicts)),
++            },
++            'conflicts': self.conflicts[:100],
++        }
++        return payload
++
++
++def match_images(raw, native_data, entry_name='com.apple.kernel', max_rounds=40, reference_data=None, pure_leaves=True):
++    """Build a map bound to the exact two input images."""
++    cache = Image(raw)
++    if entry_name not in cache.entries:
++        raise ValueError(f'No fileset entry {entry_name!r}')
++    _, at = cache.entries[entry_name]
++    entry = Image(raw, at)
++    fixups = cache.fixups()
++    original = Side(entry, fixups, entry.mapped())
++    print(f'original: {len(original.functions)} functions, {len(original.diversity)} diversities')
++    native_image = Image(native_data)
++    native = Side(native_image, native_image.fixups(), native_image.mapped())
++    print(f'native:   {len(native.functions)} functions, {len(native.diversity)} diversities')
++
++    matcher = Matcher(original, native)
++    inputs = {'kernelcache_sha256': hashlib.sha256(raw).hexdigest(),
++              'native_sha256': hashlib.sha256(native_data).hexdigest(), 'entry': entry_name}
++    print(f'reviewed anchors: {matcher.anchor_reviewed(inputs)}')
++    if reference_data is not None:
++        # Pure-leaf binds carry behaviour, not identity, so the naming reference must not use them.
++        reference_pairing = match_images(raw, reference_data, entry_name, max_rounds, pure_leaves=False)
++        reference_image = Image(reference_data)
++        reference = Side(reference_image, reference_image.fixups(), reference_image.mapped())
++        print(f'reference symbol anchors: {matcher.anchor_reference(reference, reference_pairing)}')
++        print(f'reference order anchors: {matcher.anchor_reference_order(reference, reference_pairing)}')
++    print(f'string anchors: {matcher.anchor_strings()}')
++    print(f'PAC checked shape anchors: {matcher.anchor_checked_shapes()}')
++    data = {}
++    split = 0
++    kernel = entry.mapped()
++    inside = lambda address: any(b <= address < e for b, e in kernel)
++    targets = {fix[0] for site, fix in fixups.items() if inside(fix[0]) and not inside(site)}
++    print(f'reviewed data: {matcher.reviewed_data(inputs, data)}')
++    if reference_data is not None:
++        print(f'reference data names: {matcher.reference_data(reference, reference_pairing, targets, data)}')
++    for _ in range(max_rounds):
++        bound = matcher.anchor_shapes() + matcher.propagate()
++        split = matcher.pair_data(data)
++        bound += matcher.pair_metaclass_getters(data) + matcher.pair_metaclass_vtables(data) + matcher.pair_vtable_users(data)
++        bound += matcher.pair_vtables(data) + matcher.anchor_vtables(data)
++        bound += matcher.pair_calls() + matcher.pair_data_users(data)
++        bound += matcher.pair_reference_shapes(data)
++        if not bound:
++            break
++    if pure_leaves:
++        print(f'pure leaves: {matcher.pair_pure_leaves(targets)}')
++    print(f'data slots: {matcher.pair_data_slots(targets, data)}, data by users: {matcher.pair_data_by_users(targets, data)}, '
++          f'sysctl: {matcher.pair_sysctl_variables(targets, data)}, fields: {matcher.pair_data_fields(targets, data)}')
++    payload = matcher.report(data)
++    payload['inputs'] = inputs
++    if reference_data is not None:
++        payload['reference_sha256'] = hashlib.sha256(reference_data).hexdigest()
++
++    named = sum(1 for t in targets if t in matcher.pairs or (t in data and data[t] and
++                                                             matcher.native.name_at(data[t][0])[0]))
++    payload['stats'].update({'kext_targets': len(targets), 'kext_targets_named': named,
++                             'data_votes_split': split})
++    stats = payload['stats']
++    print(f"functions: {stats['functions_matched']}/{stats['functions_original']} "
++          f"({', '.join(f'{v} {k}' for k, v in sorted(stats['functions_by_method'].items()))})")
++    print(f"data: {stats['data_matched']} ({', '.join(f'{v} {k}' for k, v in sorted(stats['data_by_method'].items())) or 'none'})")
++    print(f"kext-facing targets named: {named}/{len(targets)}")
++    print(f"conflicts: {stats['conflicts'] or 'none'}")
++    return payload
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('kernelcache', help='decompressed MH_FILESET kernelcache')
++    parser.add_argument('native', help='native arm64e kernel with symbols')
++    parser.add_argument('--entry', default='com.apple.kernel', help='fileset entry to pair')
++    parser.add_argument('--out', help='write the pairing as JSON to this path')
++    parser.add_argument('--max-rounds', type=int, default=40, help='call graph propagation rounds')
++    parser.add_argument('--reference-kernel', type=Path, help='additional symbol-bearing kernel for unique code matches')
++    args = parser.parse_args()
++    payload = match_images(Path(args.kernelcache).read_bytes(), Path(args.native).read_bytes(),
++                           args.entry, args.max_rounds,
++                           args.reference_kernel.read_bytes() if args.reference_kernel else None)
++    if args.out:
++        Path(args.out).write_text(json.dumps(payload, indent=1))
++        print(f'wrote {args.out}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/kits/NativePrelink/fileset_segmented.py b/kits/NativePrelink/fileset_segmented.py
+new file mode 100644
+index 0000000..ac71b0d
+--- /dev/null
++++ b/kits/NativePrelink/fileset_segmented.py
+@@ -0,0 +1,382 @@
++"""Emit a coalesced kernel collection using per-segment native relocation."""
++from collections import defaultdict
++import hashlib
++import hmac
++import struct
++
++from fileset_emit import (Emit, ChainReader, decode, chain_word, PAGE, MASK64,
++                          LC_SEGMENT_64, LC_SYMTAB, LC_DYLD_CHAINED_FIXUPS,
++                          LC_FILESET_ENTRY, LC_UNIXTHREAD, MH_DYLIB_IN_CACHE)
++from fileset_layout import Layout, relocate_native, relocate_original_stubs, encode_uleb, align
++from kc_image import Image, scan, signed
++from fileset_emit import inline_data_ranges, inside
++
++
++class SegmentedEmit(Emit):
++    site_pairs = {}
++
++    def rebind(self, target, site):
++        if not self.mapped(target):
++            return target
++        # A reviewed site binding wins over the target's pairing (one consumer needs a different native object).
++        native = self.site_pairs.get(site) if self.site_pairs else None
++        if native is None:
++            native = self.pairs.get(target)
++        if native is None and self.stub is not None and target in self.old_starts:
++            # A kernel function this kernel does not have: the stub reports the call site.
++            self.stubbed[self.owner(site)][target] += 1
++            native = self.stub
++        if native is None:
++            self.missing[self.owner(site)][target] += 1
++            return None
++        return self.layout.translate(native)
++
++    def place_kernel(self):
++        self.layout = Layout(self.cache, self.native, self.closure)
++        self.report['segment_layout'] = self.layout.describe()
++        self.fileoff = self.layout.placements['__TEXT'] - self.cache.base
++        self.data.extend(bytes(self.layout.size - len(self.data)))
++        for segment in self.native.segments:
++            if not segment['size']:
++                continue
++            at = self.layout.placements[segment['name']] - self.cache.base
++            self.data[at:at + segment['size']] = bytes(segment['size'])
++            source, size = segment['fileoff'], segment['filesize']
++            self.data[at:at + size] = self.native.data[source:source + size]
++        old_info = next(s for s in self.cache.segments if s['name'] == '__PRELINK_INFO')
++        new_info = self.layout.roots['__PRELINK_INFO']
++        self.data[new_info['fileoff']:new_info['fileoff'] + new_info['filesize']] = \
++            self.cache.data[old_info['fileoff']:old_info['fileoff'] + old_info['filesize']]
++        self.table_cursor = self.layout.table_begin
++
++    def append_table(self, blob):
++        at = align(self.table_cursor, 16)
++        if at + len(blob) > self.layout.table_end:
++            raise ValueError('Derived linkedit reservation is insufficient')
++        self.data[at:at + len(blob)] = blob
++        self.table_cursor = at + len(blob)
++        return at
++
++    def rewrite_native_chains(self):
++        self.native_pointers, counts = relocate_native(self.data, self.layout)
++        self.original_branches = relocate_original_stubs(self.data, self.layout)
++        self.report['native_original_branches_rebound'] = len(self.original_branches)
++        self.report['native_split_relocations'] = dict(counts)
++        self.report['native_chain_sites'] = len(self.native_pointers)
++
++    def rebuild_linkedit(self):
++        # Read original chains before any native bytes were placed in vacated
++        # pages: a chain can span old-kernel, removed-kext and retained-kext sites.
++        reader = ChainReader(self.cache.data, self.cache)
++        pointers = dict(self.native_pointers)
++        for segment in self.cache.segments:
++            for page, sites in reader.pages(segment['name']).items():
++                for offset, value in sites:
++                    site = segment['va'] + page * PAGE + offset
++                    if self.mapped(site):
++                        self.report['old_kernel_sites_dropped'] += 1
++                        continue
++                    if not self.in_closure(site):
++                        self.report['unselected_chain_sites_dropped'] += 1
++                        continue
++                    target_offset, auth, key, diversity, addrdiv, _ = decode(value)
++                    target = self.cache.base + target_offset
++                    if self.mapped(target):
++                        rebound = self.rebind(target, site)
++                        if rebound is None:
++                            self.report['closure_pointers_unmapped'] += 1
++                        else:
++                            target = rebound
++                            self.report['kext_pointers_rebound'] += 1
++                    if site in pointers:
++                        raise ValueError('Native and kext fixup sites overlap')
++                    pointers[site] = (target, auth, key, diversity, addrdiv)
++                    self.report['kext_chain_sites_kept'] += 1
++        order = list(self.layout.roots.values())
++        blob = bytearray(4 + 4 * len(order))
++        struct.pack_into('<I', blob, 0, len(order))
++        grouped = defaultdict(lambda: defaultdict(list))
++        for site, pointer in sorted(pointers.items()):
++            matches = [i for i, s in enumerate(order) if s['va'] <= site and site + 8 <= s['va'] + s['filesize']]
++            if len(matches) != 1 or site % 4:
++                raise ValueError(f'Fixup is not within one root mapping: {site:#x}')
++            index = matches[0]
++            relative = site - order[index]['va']
++            grouped[index][relative // PAGE].append((relative % PAGE, pointer))
++        for index, pages in grouped.items():
++            count = max(pages) + 1
++            if count > 65535:
++                raise ValueError('Too many chained-fixup pages')
++            piece = bytearray(struct.pack('<IHHQIH', 22 + count*2, PAGE, 8,
++                                         order[index]['va'] - self.cache.base, 0, count))
++            piece.extend(b'\xff\xff' * count)
++            for page, sites in pages.items():
++                struct.pack_into('<H', piece, 22 + page*2, sites[0][0])
++                for n, (offset, pointer) in enumerate(sites):
++                    target, auth, key, diversity, addrdiv = pointer
++                    step = (sites[n+1][0]-offset)//4 if n+1 < len(sites) else 0
++                    word = chain_word(auth, key, diversity, addrdiv, target-self.cache.base, step)
++                    struct.pack_into('<Q', self.data, order[index]['fileoff']+page*PAGE+offset, word)
++            struct.pack_into('<I', blob, 4 + index*4, len(blob))
++            blob.extend(piece)
++        blob = struct.pack('<7I', 0, 28, 28, 28, 0, 1, 0) + blob
++        self.fixups_at, self.fixups_size = self.append_table(blob), len(blob)
++        previous, starts = self.layout.placements['__TEXT'], bytearray()
++        for address in sorted(self.layout.translate(a) for a in self.native.function_starts()):
++            starts.extend(encode_uleb(address - previous))
++            previous = address
++        starts.append(0)
++        self.starts_at, self.starts_size = self.append_table(starts), len(starts)
++
++    def rewrite_branches(self):
++        """Rewrite selected executable entries using explicit ADRP provenance."""
++        for name, (_, entry_at) in self.cache.entries.items():
++            if name == 'com.apple.kernel' or self.closure is not None and name not in self.closure:
++                continue
++            for segment in Image(self.cache.data, entry_at).segments:
++                if segment['name'] != '__TEXT_EXEC' or not segment['filesize']:
++                    continue
++                blob = self.cache.data[segment['fileoff']:segment['fileoff']+segment['filesize']]
++                pools = inline_data_ranges(blob)
++                self.report['inline_data_pools_preserved'] += len(pools)
++                self.report['inline_data_bytes_preserved'] += sum(e-b for b,e in pools)
++                begin = 0
++                calls, refs = [], []
++                for end, next_begin in pools + [(len(blob), len(blob))]:
++                    chunk_calls, chunk_refs, _ = scan(blob[begin:end], segment['va']+begin, with_origins=True)
++                    calls.extend(chunk_calls)
++                    refs.extend(chunk_refs)
++                    begin = next_begin
++                for pc, target, _ in calls:
++                    if not self.mapped(target):
++                        continue
++                    rebound = self.rebind(target, pc)
++                    if rebound is None:
++                        self.report['closure_branches_unmapped'] += 1
++                        continue
++                    displacement = rebound-pc
++                    if displacement % 4 or not -(1 << 27) <= displacement < 1 << 27:
++                        raise ValueError(f'Kext branch out of range at {pc:#x}')
++                    at = segment['fileoff']+pc-segment['va']
++                    word, = struct.unpack_from('<I', self.data, at)
++                    struct.pack_into('<I', self.data, at, (word & 0xfc000000) | ((displacement>>2) & 0x3ffffff))
++                    self.report['branches_rebound'] += 1
++                groups = defaultdict(list)
++                producers = set()
++                for pc, target, kind, producer, scale in refs:
++                    if producer is not None:
++                        producers.add(producer)
++                        groups[producer].append((pc,target,kind,scale))
++                        continue
++                    if not self.mapped(target):
++                        continue
++                    rebound = self.rebind(target,pc)
++                    if rebound is None:
++                        self.report['closure_adr_unmapped'] += 1
++                        continue
++                    immediate = rebound-pc
++                    if not -(1 << 20) <= immediate < 1 << 20:
++                        raise ValueError(f'Kext ADR out of range at {pc:#x}')
++                    at = segment['fileoff']+pc-segment['va']
++                    word, = struct.unpack_from('<I', self.data, at)
++                    struct.pack_into('<I', self.data, at, (word & 0x9f00001f) |
++                                     (((immediate>>2)&0x7ffff)<<5) | ((immediate&3)<<29))
++                    self.report['adr_rebound'] += 1
++                for producer, uses in groups.items():
++                    rewritten = []
++                    for pc,target,kind,scale in uses:
++                        rebound = self.rebind(target,pc)
++                        if rebound is None:
++                            self.report['closure_adrp_unmapped'] += 1
++                            continue
++                        if self.mapped(target):
++                            if kind == 'add' and scale:
++                                raise ValueError('Shifted ADD cannot be rewritten as a low page offset')
++                            if rebound % (1 << scale):
++                                raise ValueError('Relocated load/store target is not aligned')
++                        rewritten.append((pc,rebound,kind,scale,target))
++                    if len(rewritten) != len(uses) or not any(self.mapped(t) for _,_,_,_,t in rewritten):
++                        continue
++                    pages = {target & ~4095 for _,target,_,_,_ in rewritten}
++                    if len(pages) != 1:
++                        raise ValueError(f'ADRP consumers require different pages at {producer:#x}')
++                    for pc,target,kind,scale,old_target in rewritten:
++                        self.patch_adrp_pair(segment,producer-segment['va'],pc-segment['va'],target,scale)
++                # An ADRP into the old kernel without a proven consumer cannot
++                # be silently left pointing at discarded code or data.
++                for offset in range(0,len(blob)-3,4):
++                    if inside(pools,offset):
++                        continue
++                    word, = struct.unpack_from('<I',blob,offset)
++                    pc = segment['va']+offset
++                    if word & 0x9f000000 != 0x90000000 or pc in producers:
++                        continue
++                    immediate = signed(((word>>5)&0x7ffff)<<2 | ((word>>29)&3),21)
++                    page = (pc & ~4095)+(immediate<<12)
++                    if self.mapped(page):
++                        self.missing[name][page] += 1
++                        self.report['unproven_kernel_page_references'] += 1
++
++    def patch_entry_header(self):
++        rebuilt = []
++        section_index = 0
++        for command, offset, length in self.native.commands:
++            blob = bytearray(self.native.data[offset:offset+length])
++            if command in (LC_DYLD_CHAINED_FIXUPS, 0x1d):
++                continue
++            if command == LC_SEGMENT_64:
++                name = blob[8:24].rstrip(b'\0').decode()
++                segment = self.layout.segment(name)
++                address = self.layout.placements[name]
++                struct.pack_into('<Q', blob, 24, address)
++                struct.pack_into('<Q', blob, 40, address-self.cache.base if segment['filesize'] else 0)
++                if name == '__LINKEDIT':
++                    size = self.layout.table_end - (address-self.cache.base)
++                    struct.pack_into('<Q', blob, 32, size)
++                    struct.pack_into('<Q', blob, 48, size)
++                count, = struct.unpack_from('<I', blob, 64)
++                for index in range(count):
++                    section_index += 1
++                    s = 72 + index*80
++                    struct.pack_into('<Q', blob, s+32, self.layout.section_address(section_index, 0, True))
++                    for field in (48, 56):
++                        value, = struct.unpack_from('<I', blob, s+field)
++                        if value:
++                            struct.pack_into('<I', blob, s+field, self.layout.file(value))
++            elif command == LC_SYMTAB:
++                symoff, nsyms, stroff, strsize = struct.unpack_from('<4I', blob, 8)
++                at = self.layout.file(symoff, nsyms*16)
++                struct.pack_into('<4I', blob, 8, at, nsyms, self.layout.file(stroff, strsize), strsize)
++                for index in range(nsyms):
++                    symbol = at + index*16
++                    kind, ordinal = self.data[symbol+4:symbol+6]
++                    if not kind & 0xe0 and kind & 0x0e == 0x0e:
++                        value, = struct.unpack_from('<Q', self.data, symbol+8)
++                        if not 1 <= ordinal <= len(self.native.sections):
++                            raise ValueError('N_SECT symbol has invalid section ordinal')
++                        section = self.native.sections[ordinal-1]
++                        struct.pack_into('<Q', self.data, symbol+8,
++                                         self.layout.section_address(ordinal, value-section['va'], True))
++            elif command == 0x26:
++                struct.pack_into('<II', blob, 8, self.starts_at, self.starts_size)
++            elif command in (0x1e, 0x29, 0x2b, 0x2e, 0x80000033):
++                value, size = struct.unpack_from('<II', blob, 8)
++                if size:
++                    struct.pack_into('<I', blob, 8, self.layout.file(value, size))
++            elif command == 0xb:
++                for field in (32, 40, 48, 56, 64, 72):
++                    value, = struct.unpack_from('<I', blob, field)
++                    if value:
++                        struct.pack_into('<I', blob, field, self.layout.file(value))
++            elif command in (0x22, 0x80000022):
++                for field in (8, 16, 24, 32, 40):
++                    value, size = struct.unpack_from('<II', blob, field)
++                    if size:
++                        struct.pack_into('<I', blob, field, self.layout.file(value, size))
++            elif command == LC_UNIXTHREAD:
++                pc, = struct.unpack_from('<Q', blob, 272)
++                struct.pack_into('<Q', blob, 272, self.layout.translate(pc))
++            rebuilt.append(blob)
++        commands = b''.join(rebuilt)
++        oldsize, = struct.unpack_from('<I', self.native.data, 20)
++        if len(commands) > oldsize:
++            raise ValueError('Native load commands exceed available header space')
++        self.data[self.fileoff+32:self.fileoff+32+oldsize] = commands + bytes(oldsize-len(commands))
++        struct.pack_into('<II', self.data, self.fileoff+16, len(rebuilt), len(commands))
++        flags, = struct.unpack_from('<I', self.data, self.fileoff+24)
++        struct.pack_into('<I', self.data, self.fileoff+24, flags | MH_DYLIB_IN_CACHE)
++        # corecrypto authenticates the relocated __text bytes in a fileset, but only
++        # kernels that carry a __fips_hmacs field ask for it (the 24A446 kernel does not).
++        code = next(s for s in self.native.sections if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text')
++        seals = [s for s in self.native.sections if s['name'] == '__fips_hmacs']
++        if not seals:
++            self.report['corecrypto_hmac_sha256'] = None
++            return
++        if len(seals) != 1 or seals[0]['size'] != 32:
++            raise ValueError('Expected one 32-byte corecrypto HMAC field')
++        code_at = self.layout.translate(code['va']) - self.cache.base
++        digest = hmac.new(b'\0', self.data[code_at:code_at+code['size']], hashlib.sha256).digest()
++        seal_at = self.layout.translate(seals[0]['va']) - self.cache.base
++        self.data[seal_at:seal_at+32] = digest
++        self.report['corecrypto_hmac_sha256'] = digest.hex()
++
++    def seal_components(self):
++        """Reseal original components whose FIPS HMAC covers __TEXT_EXEC,__text that branch rebinding changed.
++
++        Only a field that matched the original bytes is rewritten; the new value is the same HMAC over the
++        emitted bytes, which fipspost_get_hmac reads through MH_DYLIB_IN_CACHE (section address + slide).
++        """
++        sealed = {}
++        for name, (_, entry_at) in self.cache.entries.items():
++            if name == 'com.apple.kernel' or self.closure is not None and name not in self.closure:
++                continue
++            sections = Image(self.cache.data, entry_at).sections
++            seals = [s for s in sections if s['name'] == '__fips_hmacs']
++            if not seals:
++                continue
++            code = [s for s in sections if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text']
++            if len(seals) != 1 or seals[0]['size'] != 32 or len(code) != 1:
++                raise ValueError(f'{name}: unexpected FIPS HMAC layout')
++            code_at, seal_at = (self.cache.offset(code[0]['va'], code[0]['size']),
++                                self.cache.offset(seals[0]['va'], 32))
++            original = hmac.new(b'\0', self.cache.data[code_at:code_at + code[0]['size']], hashlib.sha256).digest()
++            if original != self.cache.data[seal_at:seal_at + 32]:
++                raise ValueError(f'{name}: original FIPS HMAC does not cover its __text')
++            digest = hmac.new(b'\0', self.data[code_at:code_at + code[0]['size']], hashlib.sha256).digest()
++            self.data[seal_at:seal_at + 32] = digest
++            sealed[name] = digest.hex()
++        self.report['component_hmacs'] = sealed
++
++    def patch_headers(self):
++        rebuilt = []
++        native_pc = struct.unpack_from('<Q', self.native.data, self.native.command(LC_UNIXTHREAD)[0]+272)[0]
++        for command, offset, length in self.cache.commands:
++            blob = bytearray(self.cache.data[offset:offset+length])
++            if command == LC_SEGMENT_64:
++                name = blob[8:24].rstrip(b'\0').decode()
++                if name not in self.layout.roots:
++                    continue
++                segment = self.layout.roots[name]
++                old_address, = struct.unpack_from('<Q', blob, 24)
++                struct.pack_into('<4Q', blob, 24, segment['va'], segment['size'], segment['fileoff'], segment['filesize'])
++                count, = struct.unpack_from('<I', blob, 64)
++                for index in range(count):
++                    s = 72 + index*80
++                    address, = struct.unpack_from('<Q', blob, s+32)
++                    fileoff, = struct.unpack_from('<I', blob, s+48)
++                    delta = segment['va'] - old_address
++                    struct.pack_into('<Q', blob, s+32, address+delta)
++                    if fileoff:
++                        struct.pack_into('<I', blob, s+48, fileoff+delta)
++            elif command == LC_DYLD_CHAINED_FIXUPS:
++                struct.pack_into('<II', blob, 8, self.fixups_at, self.fixups_size)
++            elif command == LC_FILESET_ENTRY:
++                name_at, = struct.unpack_from('<I', blob, 24)
++                name = blob[name_at:].split(b'\0',1)[0].decode()
++                if name == 'com.apple.kernel':
++                    struct.pack_into('<QQ', blob, 8, self.layout.placements['__TEXT'], self.fileoff)
++                elif self.closure is not None and name not in self.closure:
++                    self.report['unselected_entries_dropped'] += 1
++                    continue
++            elif command == LC_UNIXTHREAD:
++                struct.pack_into('<Q', blob, 272, self.layout.translate(native_pc))
++            elif command in (0x1d,):
++                continue
++            rebuilt.append(blob)
++        original_names = {s['name'] for s in self.cache.segments}
++        for name, segment in self.layout.roots.items():
++            if name in original_names:
++                continue
++            source = self.layout.segment(name)
++            maxprot, initprot = struct.unpack_from('<II', self.native.data, source['command_offset']+56)
++            rebuilt.append(struct.pack('<II16sQQQQIIII', LC_SEGMENT_64, 72, name.encode().ljust(16,b'\0'),
++                                       segment['va'], segment['size'], segment['fileoff'], segment['filesize'],
++                                       maxprot, initprot, 0, 0))
++        payload = b''.join(rebuilt)
++        limit = self.layout.roots['__TEXT']['filesize']
++        if len(payload)+32 > limit:
++            raise ValueError('Root commands exceed header mapping')
++        self.data[32:limit] = payload + bytes(limit-32-len(payload))
++        struct.pack_into('<II', self.data, 16, len(rebuilt), len(payload))
++        self.report['native_base'] = hex(self.layout.placements['__TEXT'])
++        self.report['native_fileoff'] = hex(self.fileoff)
+diff --git a/kits/NativePrelink/fileset_shape.py b/kits/NativePrelink/fileset_shape.py
+new file mode 100644
+index 0000000..d9397b0
+--- /dev/null
++++ b/kits/NativePrelink/fileset_shape.py
+@@ -0,0 +1,47 @@
++"""Compare code across compiler-inserted arm64e authentication checks.
++
++This only normalizes analysis. Emitted instructions keep every native check.
++"""
++import struct
++
++from kc_image import scan, signed
++
++
++def checked_shape(code, pc):
++    words = list(struct.unpack('<' + 'I' * (len(code) // 4), code))
++    removed = set()
++    for i in range(len(words)):
++        # mov x17,x16; xpac[di] x17; cmp x16,x17; b.eq +8;
++        # brk #0xc47[02]. Only accept the complete compiler sequence.
++        block = words[i:i + 5]
++        if block in ([0xaa1003f1, 0xdac147f1, 0xeb11021f, 0x54000040, 0xd4388e40],
++                     [0xaa1003f1, 0xdac143f1, 0xeb11021f, 0x54000040, 0xd4388e00]):
++            # AUTIA/AUTDA x16,x17 must immediately precede the check.
++            if i and words[i - 1] in (0xdac11230, 0xdac11a30):
++                removed.update(range(i, i + 5))
++        # Compiler's LR authentication check before a tail branch.
++        if (words[i:i + 3] == [0xca1e07d0, 0xb6f00050, 0xd4388e20] and
++                i + 3 < len(words) and words[i + 3] & 0xfc000000 == 0x14000000):
++            removed.update(range(i, i + 3))
++
++    calls, refs, shape = scan(code, pc)
++    positions = {i * 4: j * 4 for j, i in enumerate(i for i in range(len(words)) if i not in removed)}
++    normalized = []
++    for i, word in enumerate(words):
++        if i in removed:
++            continue
++        bits, shift = (26, 0) if word & 0x7c000000 == 0x14000000 else \
++                      (19, 5) if word & 0xff000010 == 0x54000000 or word & 0x7e000000 == 0x34000000 else \
++                      (14, 5) if word & 0x7e000000 == 0x36000000 else (0, 0)
++        value = shape[i]
++        if bits:
++            mask = (1 << bits) - 1
++            target = i * 4 + signed((word >> shift) & mask, bits) * 4
++            if 0 <= target < len(code):
++                if target not in positions:
++                    # Another edge enters a check: it is not disposable padding.
++                    return shape, {j * 4: j * 4 for j in range(len(words))}, calls, refs
++                immediate = (positions[target] - positions[i * 4]) // 4
++                value = (word & ~(mask << shift)) | ((immediate & mask) << shift)
++        normalized.append(value)
++    return normalized, positions, calls, refs
+diff --git a/kits/NativePrelink/kc_image.py b/kits/NativePrelink/kc_image.py
+new file mode 100644
+index 0000000..1407d8e
+--- /dev/null
++++ b/kits/NativePrelink/kc_image.py
+@@ -0,0 +1,229 @@
++#!/usr/bin/env python3
++"""Read arm64e kernel images: fileset entries, chained fixups, function starts and code references."""
++import struct
++
++LC_SEGMENT_64, LC_SYMTAB, LC_FUNCTION_STARTS = 0x19, 0x2, 0x26
++LC_DYLD_CHAINED_FIXUPS, LC_FILESET_ENTRY = 0x80000034, 0x80000035
++PTR_ARM64E_KERNEL, PTR_64_KERNEL_CACHE = 7, 8
++
++
++class Image:
++    """One Mach-O header inside a file; segment file offsets are absolute in that file."""
++
++    def __init__(self, data, at=0):
++        self.data, self.at = data, at
++        magic, cpu, _, self.kind, count, size = struct.unpack_from('<6I', data, at)
++        if (magic, cpu) != (0xfeedfacf, 0x100000c):
++            raise ValueError('Expected a 64-bit ARM Mach-O header')
++        self.segments, self.sections, self.commands = [], [], []
++        self.entries = {}
++        offset = at + 32
++        for _ in range(count):
++            command, length = struct.unpack_from('<II', data, offset)
++            self.commands.append((command, offset, length))
++            if command == LC_SEGMENT_64:
++                name, va, vmsize, fileoff, filesize = struct.unpack_from('<16s4Q', data, offset + 8)
++                name = name.rstrip(b'\0').decode()
++                self.segments.append({'name': name, 'va': va, 'size': vmsize,
++                                      'fileoff': fileoff, 'filesize': filesize, 'command_offset': offset})
++                nsects, = struct.unpack_from('<I', data, offset + 64)
++                for index in range(nsects):
++                    s = offset + 72 + 80 * index
++                    sect, seg = (data[s + i:s + i + 16].rstrip(b'\0').decode() for i in (0, 16))
++                    va_s, size_s = struct.unpack_from('<QQ', data, s + 32)
++                    self.sections.append({'segment': seg, 'name': sect, 'va': va_s, 'size': size_s})
++            elif command == LC_FILESET_ENTRY:
++                va, fileoff, name_at = struct.unpack_from('<QQI', data, offset + 8)
++                end = data.index(b'\0', offset + name_at)
++                self.entries[data[offset + name_at:end].decode()] = (va, fileoff)
++            offset += length
++        self.base = next(s['va'] for s in self.segments if s['fileoff'] == 0 and s['filesize']) \
++            if at == 0 else self.segments[0]['va']
++
++    def command(self, kind):
++        found = [(offset, length) for command, offset, length in self.commands if command == kind]
++        return found[0] if found else None
++
++    def mapped(self):
++        return [(s['va'], s['va'] + s['size']) for s in self.segments if s['size'] and s['name'] != '__LINKEDIT']
++
++    def offset(self, va, length=1):
++        for s in self.segments:
++            if s['va'] <= va and va + length <= s['va'] + s['filesize']:
++                return s['fileoff'] + va - s['va']
++        raise ValueError(f'Unbacked address {va:#x}')
++
++    def read(self, va, length):
++        at = self.offset(va, length)
++        return self.data[at:at + length]
++
++    def section(self, va):
++        for s in self.sections:
++            if s['va'] <= va < s['va'] + s['size']:
++                return s
++        return None
++
++    def cstring(self, va):
++        section = self.section(va)
++        if section is None or section['segment'] not in ('__TEXT', '__DATA_CONST') or \
++                not section['name'].startswith(('__cstring', '__const', '__os_log')):
++            return None
++        at = self.offset(va)
++        end = self.data.find(b'\0', at, at + 4096)
++        if end <= at:
++            return None
++        raw = self.data[at:end]
++        return raw.decode('latin-1') if all(32 <= b < 127 or b in (9, 10) for b in raw) else None
++
++    def symbols(self):
++        """Defined section symbols, address -> names."""
++        found = self.command(LC_SYMTAB)
++        result = {}
++        if not found:
++            return result
++        symoff, count, stroff, _ = struct.unpack_from('<4I', self.data, found[0] + 8)
++        for index in range(count):
++            strx, kind, _, _, value = struct.unpack_from('<IBBHQ', self.data, symoff + 16 * index)
++            if kind & 0xe0 or kind & 0x0e != 0x0e:
++                continue
++            end = self.data.index(b'\0', stroff + strx)
++            result.setdefault(value, []).append(self.data[stroff + strx:end].decode())
++        return result
++
++    def absolute_symbols(self):
++        """Named N_ABS values; unlike section symbols these do not move with code."""
++        found = self.command(LC_SYMTAB)
++        result = {}
++        if not found:
++            return result
++        symoff, count, stroff, _ = struct.unpack_from('<4I', self.data, found[0] + 8)
++        for index in range(count):
++            strx, kind, _, _, value = struct.unpack_from('<IBBHQ', self.data, symoff + 16 * index)
++            if kind & 0xe0 or kind & 0x0e != 0x02:
++                continue
++            end = self.data.index(b'\0', stroff + strx)
++            name = self.data[stroff + strx:end].decode()
++            if name in result and result[name] != value:
++                raise ValueError(f'Conflicting absolute symbol {name}')
++            result[name] = value
++        return result
++
++    def function_starts(self):
++        found = self.command(LC_FUNCTION_STARTS)
++        if not found:
++            return []
++        dataoff, size = struct.unpack_from('<II', self.data, found[0] + 8)
++        text = next(s['va'] for s in self.segments if s['name'] == '__TEXT')
++        starts, address, at, end = [], text, dataoff, dataoff + size
++        while at < end:
++            value = shift = 0
++            while True:
++                byte = self.data[at]; at += 1
++                value |= (byte & 0x7f) << shift; shift += 7
++                if not byte & 0x80:
++                    break
++            if not value:
++                break
++            address += value
++            starts.append(address)
++        return starts
++
++    def fixups(self):
++        """Chained fixups: site va -> (target va, auth, key, diversity, address diversity)."""
++        found = self.command(LC_DYLD_CHAINED_FIXUPS)
++        if not found:
++            return {}
++        dataoff, _ = struct.unpack_from('<II', self.data, found[0] + 8)
++        _, starts_offset, _, _, imports, _, _ = struct.unpack_from('<7I', self.data, dataoff)
++        if imports:
++            raise ValueError('Chained fixup imports are not supported')
++        table = dataoff + starts_offset
++        count, = struct.unpack_from('<I', self.data, table)
++        result = {}
++        for index in range(count):
++            relative, = struct.unpack_from('<I', self.data, table + 4 + 4 * index)
++            if not relative:
++                continue
++            at = table + relative
++            _, page_size, fmt, segment_offset, _, pages = struct.unpack_from('<IHHQIH', self.data, at)
++            if fmt not in (PTR_ARM64E_KERNEL, PTR_64_KERNEL_CACHE):
++                raise ValueError(f'Unsupported chained pointer format {fmt}')
++            for page, start in enumerate(struct.unpack_from(f'<{pages}H', self.data, at + 22)):
++                if start == 0xffff:
++                    continue
++                if start & 0x8000:
++                    raise ValueError('Multi-start pages are not supported')
++                site = self.base + segment_offset + page * page_size + start
++                while True:
++                    value, = struct.unpack_from('<Q', self.data, self.offset(site, 8))
++                    auth = value >> 63
++                    if fmt == PTR_64_KERNEL_CACHE:
++                        if (value >> 30) & 3:
++                            raise ValueError('Only cache level 0 is supported')
++                        target, step = self.base + (value & 0x3fffffff), (value >> 51) & 0xfff
++                    else:
++                        if (value >> 62) & 1:
++                            raise ValueError('Chained binds are not supported')
++                        offset = value & 0xffffffff if auth else (value & 0x7ffffffffff) | ((value >> 43) & 0xff) << 56
++                        target, step = self.base + offset, (value >> 51) & 0x7ff
++                    result[site] = (target, auth, (value >> 49) & 3 if auth else None,
++                                    (value >> 32) & 0xffff if auth else None, (value >> 48) & 1 if auth else None)
++                    if not step:
++                        break
++                    site += step * 4
++        return result
++
++
++def signed(value, bits):
++    return value - (1 << bits) if value & (1 << (bits - 1)) else value
++
++
++def scan(code, pc, with_origins=False):
++    """Branch targets, resolved adrp-based addresses and a relocation-masked shape of one function."""
++    calls, refs, shape, pages = [], [], [], {}
++    for offset in range(0, len(code) - 3, 4):
++        word, = struct.unpack_from('<I', code, offset)
++        here = pc + offset
++        if word & 0x7c000000 == 0x14000000:
++            target = here + signed(word & 0x3ffffff, 26) * 4
++            calls.append((here, target, bool(word >> 31)))
++            shape.append(word if pc <= target < pc + len(code) else word & 0xfc000000)
++            pages.clear()
++            continue
++        if word & 0x9f000000 == 0x90000000:
++            immediate = signed(((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3), 21)
++            pages[word & 31] = ((here & ~4095) + (immediate << 12), here)
++            shape.append(word & 0x9f00001f)
++            continue
++        if word & 0x9f000000 == 0x10000000:
++            ref = (here, here + signed(((word >> 5) & 0x7ffff) << 2 | ((word >> 29) & 3), 21), 'adr')
++            refs.append(ref + (None, 0) if with_origins else ref)
++            shape.append(word & 0x9f00001f)
++            pages.pop(word & 31, None)
++            continue
++        base = (word >> 5) & 31
++        if word & 0xff800000 == 0x91000000 and base in pages:
++            shift = 12 if word & 0x400000 else 0
++            ref = (here, pages[base][0] + (((word >> 10) & 0xfff) << shift), 'add')
++            refs.append(ref + (pages[base][1], shift) if with_origins else ref)
++            shape.append(word & 0xffc003ff)
++            pages.pop(word & 31, None)
++            continue
++        if word & 0x3b000000 == 0x39000000 and base in pages:
++            size = word >> 30
++            if word & 0x04800000 == 0x04800000:
++                size = 4
++            ref = (here, pages[base][0] + (((word >> 10) & 0xfff) << size), 'ldst')
++            refs.append(ref + (pages[base][1], size) if with_origins else ref)
++            shape.append(word & 0xffc003ff)
++            # A load can replace the register that held the page. Dropping a
++            # store's source register is conservative and also handles SIMD
++            # encodings without pretending to perform full register analysis.
++            pages.pop(word & 31, None)
++            continue
++        shape.append(word)
++        # Never carry a guessed register value through a clobber or control
++        # flow merge. Only the recognized straight-line operations above keep
++        # page provenance; an unknown instruction terminates that evidence.
++        pages.clear()
++    return calls, refs, shape
+diff --git a/kits/NativePrelink/native_prelink.py b/kits/NativePrelink/native_prelink.py
+index 3ff3095..d9297ac 100644
+--- a/kits/NativePrelink/native_prelink.py
++++ b/kits/NativePrelink/native_prelink.py
+@@ -15,8 +15,10 @@ def macho(data, at=0):
+     if at < 0 or at + 32 > len(data):
+         raise ValueError('Mach-O header outside image')
+     magic, cpu, subtype, kind, count, size = struct.unpack_from('<6I', data, at)
+-    if (magic, cpu, subtype) != (0xfeedfacf, 0x100000c, 0):
+-        raise ValueError('Only ordinary little-endian ARM64 is supported')
++    # CPU_SUBTYPE_ARM64E records CPU_SUBTYPE_PTRAUTH_ABI (0x80000000) in the high bit of
++    # the cpusubtype field, so mask it off before comparing the base subtype.
++    if magic != 0xfeedfacf or cpu != 0x100000c or (subtype & 0x00ffffff) not in (0, 2):
++        raise ValueError('Only little-endian ARM64/ARM64E is supported')
+     end = at + 32 + size
+     if end > len(data):
+         raise ValueError('Load commands outside image')
+diff --git a/kits/PaganiVerifiedRoot/tests/check.py b/kits/PaganiVerifiedRoot/tests/check.py
+index 275d81a..904cd9d 100644
+--- a/kits/PaganiVerifiedRoot/tests/check.py
++++ b/kits/PaganiVerifiedRoot/tests/check.py
+@@ -6,6 +6,7 @@ import importlib.util
+ import io
+ import json
+ import os
++import platform
+ from pathlib import Path
+ import subprocess
+ import uuid
+@@ -35,14 +36,23 @@ spec.loader.exec_module(manifest)
+ data = bytes((i * 23 + i // 4096) & 255 for i in range(4096 * 3 + 512))
+ record = manifest.make(io.BytesIO(data), len(data), keys / 'owner.pem', keys / 'owner-public.pem',
+                        uuid.UUID('01e286f1-f4dd-4b2f-99d9-4973337fc788'), 7, out / 'signed')
+-library = out / 'verified-root.dylib'
+-subprocess.run(['xcrun', 'clang', '-std=c11', '-Wall', '-Wextra', '-Werror', '-dynamiclib',
+-                '-I', ROOT / 'include', '-I', args.openssl_prefix / 'include', ROOT / 'src/verified_root.c',
+-                ROOT / 'tests/openssl_provider.c', '-L', args.openssl_prefix / 'lib', '-lcrypto', '-o', library], check=True)
+-sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+-subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk,
+-                '-std=c11', '-ffreestanding', '-Wall', '-Wextra', '-Werror', '-I', ROOT / 'include',
+-                '-c', ROOT / 'src/verified_root.c', '-o', out / 'verified-root-arm64.o'], check=True)
++host_system = platform.system()
++library = out / ('verified-root.so' if host_system == 'Linux' else 'verified-root.dylib')
++sources = ['-I', str(ROOT / 'include'), '-I', str(args.openssl_prefix / 'include'),
++           str(ROOT / 'src/verified_root.c'), str(ROOT / 'tests/openssl_provider.c'),
++           '-L', str(args.openssl_prefix / 'lib'), '-lcrypto', '-o', str(library)]
++if host_system == 'Linux':
++    # The host half is ordinary portable C; build it as a shared object with the platform compiler.
++    subprocess.run(['clang', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fPIC', '-shared', *sources], check=True)
++    subprocess.run(['clang', '--target=arm64-apple-ios17.0', '-std=c11', '-ffreestanding', '-Wall',
++                    '-Wextra', '-Werror', '-I', str(ROOT / 'include'), '-c', str(ROOT / 'src/verified_root.c'),
++                    '-o', str(out / 'verified-root-arm64.o')], check=True)
++else:
++    subprocess.run(['xcrun', 'clang', '-std=c11', '-Wall', '-Wextra', '-Werror', '-dynamiclib', *sources], check=True)
++    sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
++    subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk,
++                    '-std=c11', '-ffreestanding', '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'include'),
++                    '-c', str(ROOT / 'src/verified_root.c'), '-o', str(out / 'verified-root-arm64.o')], check=True)
+ 
+ 
+ class View(ctypes.Structure):

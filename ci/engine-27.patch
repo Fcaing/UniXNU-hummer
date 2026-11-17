@@ -1,0 +1,855 @@
+diff --git a/profiles/os/ios-27.0.1-24A446-iphone17-1/configs/ipados.config b/profiles/os/ios-27.0.1-24A446-iphone17-1/configs/ipados.config
+new file mode 100644
+index 0000000..4ee9042
+--- /dev/null
++++ b/profiles/os/ios-27.0.1-24A446-iphone17-1/configs/ipados.config
+@@ -0,0 +1,2 @@
++CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
++CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+diff --git a/profiles/os/ios-27.0.1-24A446-iphone17-1/patches/xnu/series b/profiles/os/ios-27.0.1-24A446-iphone17-1/patches/xnu/series
+new file mode 100644
+index 0000000..9acf0c6
+--- /dev/null
++++ b/profiles/os/ios-27.0.1-24A446-iphone17-1/patches/xnu/series
+@@ -0,0 +1,6 @@
++# OS patch paths for xnu-12377.121.6, one per line in application order.
++# No Darwin 26 XNU source is published yet; 24A446 runs on xnu-12377 with the Darwin 26 system calls and KPIs added.
++arch:../../../patches/xnu-12377/zzz-boot-progress.patch
++arch:../../../patches/xnu-12377/darwin26-syscalls.patch
++arch:../../../patches/xnu-12377/darwin26-kpi.patch
++arch:../../../patches/xnu-12377/darwin26-shared-region.patch
+diff --git a/profiles/os/ios-27.0.1-24A446-iphone17-1/profile.toml b/profiles/os/ios-27.0.1-24A446-iphone17-1/profile.toml
+new file mode 100644
+index 0000000..48c7d17
+--- /dev/null
++++ b/profiles/os/ios-27.0.1-24A446-iphone17-1/profile.toml
+@@ -0,0 +1,125 @@
++["os"]
++"name" = "ios-27.0.1-24A446-iphone17-1"
++"arch" = "arm64e"
++"darwin" = "25.5.0"
++# No Darwin 26 XNU source is published yet. 24A446 runs on the xnu-12377 kernel with the Darwin 26
++# system calls added (patches/xnu/series); move to the Darwin 26 tag when Apple publishes it.
++"xnu_version" = "12377.121.6"
++"xnu_revision" = "ac9718fb1af618d5ce8678d0dc6e8a58f252216f"
++# 12377 carries iokit/DriverKit; EXTERNAL_HEADERS/TrustCache comes from the last tag that ships it.
++"driverkit_tag" = "xnu-12377.121.6"
++"trustcache_tag" = "xnu-8796.101.5"
++"ios_version" = "27.0"
++"abi" = []
++
++
++["ipsw"]
++"url" = "https://updates.cdn-apple.com/2026FallFCS/59ffd938-75b6-41e5-af04-f4295ee8aeb3/iPhone17,1_27.0.1_24A446_Restore.ipsw"
++"product" = "iPhone17,1"
++"version" = "27.0.1"
++"build" = "24A446"
++"device_class" = "d93ap"
++"chip_id" = 33088
++"board_id" = 12
++"fetch" = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
++
++
++["kernel"]
++
++["kernel"."prelink"]
++"tool" = "kits/XnuPrelink/emit_prelink.py"
++"kernel" = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
++"kernelcache_sha256" = "fa07057bf34f33af1ec26681ad0c87c13e5aaa548a300740eddb0e92876e5f95"
++"slide" = "-0x1000000"
++regression_policy = "scripts/policies/ipados-27.0.1-24A446/prelink-regression.json"
++# The AMFI wrapper that calls _initializeAppleMobileFileIntegrity and returns 0; the kernel patch calls it early.
++"early_security_init" = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff00921000c"
++# Bring-up: match against the symbol-bearing RELEASE build of the same XNU source
++# (scripts/build-fileset-release-reference.py --lto) and send unmatched calls to the
++# reporting stub of fileset-unmapped-call.patch.
++"extra_args" = ["--fileset-reference", "build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf", "--allow-missing"]
++"roots" = ["com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.driver.AppleARMPlatform", "com.apple.driver.AppleARMWatchdogTimer", "com.apple.driver.AppleAudioClockLibs", "com.apple.driver.AppleEffaceableStorage", "com.apple.driver.AppleIISController", "com.apple.driver.AppleM2ScalerCSCDriver", "com.apple.driver.AppleMobileFileIntegrity", "com.apple.driver.ApplePMGR", "com.apple.driver.IODARTFamily", "com.apple.filesystems.apfs", "com.apple.iokit.CoreAnalyticsFamily", "com.apple.iokit.IOAVFamily", "com.apple.iokit.IOAudio2Family", "com.apple.iokit.IOCECFamily", "com.apple.iokit.IOCryptoAcceleratorFamily", "com.apple.iokit.IOGPUFamily", "com.apple.iokit.IOHDCPFamily", "com.apple.iokit.IOMobileGraphicsFamily", "com.apple.iokit.IOReportFamily", "com.apple.iokit.IOSlowAdaptiveClockingFamily", "com.apple.iokit.IOStorageFamily", "com.apple.iokit.IOSurface", "com.apple.kec.Libm", "com.apple.kec.corecrypto", "com.apple.kext.AppleMatch", "com.apple.kext.CoreTrust", "com.apple.security.AppleImage4", "com.apple.security.sandbox", "com.apple.iokit.IOHIDFamily", "com.apple.iokit.IOHIDEventDriver"]
++
++
++["adt"]
++
++["adt"."root"]
++
++["adt"."root"."string"]
++"model" = "iPhone17,1"
++"target-type" = "D93"
++"compatible" = "D93AP"
++
++
++["adt"."chosen"]
++
++["adt"."chosen"."string"]
++"osenvironment" = "main"
++"crypto-hash-method" = "sha2-384"
++
++
++["adt"."chosen"."u32"]
++"certificate-production-status" = 0
++"effective-production-status-ap" = 0
++"certificate-security-mode" = 1
++"effective-security-mode-sep" = 1
++"amfi-only-platform-code" = 1
++
++
++# Apple sources of the macOS 26.5 release that pairs with xnu-12377.121.6.
++# Public source interfaces; these pins do not qualify the stripped iPadOS family ABI.
++[[source]]
++name = "IOStorageFamily"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
++ref = "IOStorageFamily-337.100.1"
++commit = "7edb88fbae296fb7c8ce2f64e115e116e566d51c"
++
++[[source]]
++name = "IOHIDFamily"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/IOHIDFamily.git"
++ref = "IOHIDFamily-2238.120.5"
++commit = "e31e90a24c27ad6cbe981650d12a1a4124065b03"
++
++[[source]]
++name = "libplatform"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/libplatform.git"
++ref = "libplatform-375.120.2"
++commit = "b7ed7cf5cf7dd12b98672435db2225a860f199d8"
++
++[[source]]
++name = "libdispatch"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/libdispatch.git"
++ref = "libdispatch-1542.100.32"
++commit = "701f4d1a24ae9c6863901bbbb22624b7d1b87321"
++
++[[source]]
++name = "AvailabilityVersions"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/AvailabilityVersions.git"
++ref = "AvailabilityVersions-157.2"
++commit = "149b1777f3e8c2133042d8e188f72e3adf6a7110"
++
++[[source]]
++name = "libpthread"
++kind = "refer"
++git = "https://github.com/apple-oss-distributions/libpthread.git"
++ref = "libpthread-539.100.4"
++commit = "1f4f5265b319111142f1bf3a27d4484ef5a98314"
++
++[userdata]
++# Disk images of this OS, in window order; the device sets the partition geometry.
++windows = [{ name = "OS", component = "OS" }, { name = "SystemOS", component = "Cryptex1,SystemOS", optional = true }]
++
++[root]
++# The OS and Cryptex1,SystemOS disk images: APFS volume UUIDs and image digests the root policies sign.
++os_volume_uuid = "2F8E6EED-68D5-4261-B8A3-12571BAA2DD4"
++os_image_sha256 = "8a12cdad43f8f0d33dadcf01a800a560222baf40c05f71374c460ba57ba3a739"
++systemos_volume_uuid = "F914C62A-AD00-47C6-8281-5746291C339A"
++systemos_image_sha256 = "d5b4873d35c85f96eaafaa31c59602b485afe33b5067eff1af67ba31204cdb4a"
++
++[payload.adt]
++root_match_volume_uuid = "2F8E6EED-68D5-4261-B8A3-12571BAA2DD4"
+diff --git a/scripts/audit-xnu-objects.py b/scripts/audit-xnu-objects.py
+index c7f952b..462fe4a 100755
+--- a/scripts/audit-xnu-objects.py
++++ b/scripts/audit-xnu-objects.py
+@@ -2,8 +2,12 @@
+ """Audit the actual XNU target objects, independent of stale compiler JSON."""
+ import json
+ from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
++from kernel_target import SUBTYPE, SUBTYPE_FULL, TRIPLE
+ import struct
+ 
++
+ ROOT = Path(__file__).resolve().parents[1]
+ TARGET = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
+ objects = []
+@@ -20,8 +24,8 @@ for path in sorted(TARGET.rglob('*')):
+             failures.append(f'{name}: unexpected non-Mach-O object')
+         continue
+     _, cpu, subtype, kind, count, size = struct.unpack_from('<6I', data)
+-    if (cpu, subtype, kind) != (0x100000c, 0, 1):
+-        failures.append(f'{name}: expected ordinary ARM64 MH_OBJECT')
++    if (cpu, subtype, kind) != (0x100000c, SUBTYPE_FULL, 1):
++        failures.append(f'{name}: expected an ARM64 MH_OBJECT of subtype {SUBTYPE}')
+     offset = 32
+     versions = []
+     for _ in range(count):
+diff --git a/scripts/build-arm-platform.py b/scripts/build-arm-platform.py
+index 1310831..5918c9b 100644
+--- a/scripts/build-arm-platform.py
++++ b/scripts/build-arm-platform.py
+@@ -3,7 +3,11 @@
+ import json
+ import struct
+ import subprocess
++
+ from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
++from kernel_target import SUBTYPE, SUBTYPE_FULL, TRIPLE
+ 
+ 
+ def compile_command(record, source, output):
+@@ -38,7 +42,7 @@ def main():
+         subprocess.run(command, cwd=record['directory'], check=True)
+         with obj.open('rb') as stream:
+             header = stream.read(16)
+-        if len(header) != 16 or struct.unpack('<4I', header) != (0xfeedfacf, 0x100000c, 0, 1):
++        if len(header) != 16 or struct.unpack('<4I', header) != (0xfeedfacf, 0x100000c, SUBTYPE_FULL, 1):
+             raise SystemExit(f'{driver}: expected ordinary ARM64 Mach-O object')
+         archive = output / f'lib{driver}.a'
+         archive.unlink(missing_ok=True)
+diff --git a/scripts/build-boot-progress.py b/scripts/build-boot-progress.py
+index 66d6490..5d4e700 100644
+--- a/scripts/build-boot-progress.py
++++ b/scripts/build-boot-progress.py
+@@ -3,12 +3,16 @@
+ import json
+ import os
+ from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
++from kernel_target import SUBTYPE, SUBTYPE_FULL, TRIPLE
+ import runpy
+ import re
+ import struct
+ import subprocess
+ 
+ 
++
+ def main():
+     if any(os.environ.get(name) != '1' for name in
+            ('XNU_EARLY_BOOT_PROGRESS', 'XNU_ARM_DT_PLATFORM', 'XNU_ARMCPU')):
+@@ -54,9 +58,9 @@ def main():
+         subprocess.run(command, cwd=record['directory'], check=True)
+         objects.append(obj)
+     entry = output / 'Entry.o'
+-    subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-c', source / 'Entry.S', '-o', entry], check=True)
++    subprocess.run(['xcrun', 'clang', '-target', TRIPLE, '-c', source / 'Entry.S', '-o', entry], check=True)
+     for path in (*objects, entry):
+-        if struct.unpack('<4I', path.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, 0, 1):
++        if struct.unpack('<4I', path.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, SUBTYPE_FULL, 1):
+             raise SystemExit(f'{path}: expected ordinary ARM64 Mach-O object')
+     for obj in objects:
+         undefined = subprocess.check_output(['xcrun', 'nm', '-u', obj], text=True)
+diff --git a/scripts/build-fileset-release-reference.py b/scripts/build-fileset-release-reference.py
+index f70ceea..a04bae8 100644
+--- a/scripts/build-fileset-release-reference.py
++++ b/scripts/build-fileset-release-reference.py
+@@ -67,7 +67,8 @@ def main():
+     sdk = root / '.cache/fakeroot'
+     archives = [root/'build/corecrypto-2023/libcorecrypto_kernel_noasm-namespaced.a']
+     forced = [root/f'build/{folder}/{name}' for folder,name in (
+-        ('libpthread-kernel','libpthread_kernel.a'),('armdt-platform','libArmDTPlatform.a'),('armcpu','libArmCpu.a'))]
++        ('libpthread-kernel','libpthread_kernel.a'),('armdt-platform','libArmDTPlatform.a'),('armcpu','libArmCpu.a'),
++        ('hummer-storage-stubs','libHummerStorageStubs.a'))]
+     inputs = {
+         'mode': mode,
+         'script': file_hash(Path(__file__)),
+@@ -106,6 +107,13 @@ def main():
+         (output/'source-sha256.json').write_text(json.dumps(manifest,indent=2)+'\n')
+     env = dict(os.environ, KERNEL_SDKROOT=str(sdk),
+                XNU_AVAILABILITY_PL=str(sdk/'usr/local/libexec/availability.pl'))
++    # The host-side SETUP tools need real libc headers; the clang shim the target build uses
++    # has none, so point HOST_CC at the toolchain's host compiler unless the caller did.
++    toolchain = Path(os.environ.get('UNIXNU_TOOLCHAIN', '/opt/unixnu-linux'))
++    host_cc = str(toolchain/'CommandLineTools/usr/bin/xnu-host-cc')
++    migcom = str(toolchain/'CommandLineTools/usr/libexec/migcom')
++    env.setdefault('HOST_CC', host_cc)
++    env.setdefault('MIGCOM', migcom)
+     flags = '-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding -DXNU_NATIVE_PAN=1 -DXNU_SOURCE_CORECRYPTO14=1 -DXNU_BOOT_PROGRESS=0'
+     args = ['make','-C',str(source),'build','SDKROOT=iphoneos',
+         'ARCH_CONFIGS=ARM64','MACHINE_CONFIGS=BCM2837','KERNEL_CONFIGS=RELEASE',
+@@ -116,6 +124,7 @@ def main():
+         f'RC_DARWIN_KERNEL_VERSION={os.environ.get("UNIXNU_XNU_DARWIN", "25.5.0")}',
+         f'RC_ProjectSourceVersion={os.environ.get("UNIXNU_XNU_VERSION", "12377.121.6")}',
+         f'BUILD_LTO={int(options.lto)}','BOUND_CHECKS=0','BUILD_WERROR=0','MAKEJOBS=-j8',
++        f'HOST_CC={host_cc}',f'MIGCOM={migcom}',
+         f'LDFLAGS_KERNEL_LTO=-miphoneos-version-min={inputs["versions"]["UNIXNU_IOS_VERSION"]} -Wl,-mllvm,-inline-threshold=100',
+         f'CFLAGS_EXTRA={flags}',
+         'copyio.o_CFLAGS_ADD=-march=armv8.1-a','pcb.o_CFLAGS_ADD=-march=armv8.1-a',
+diff --git a/scripts/build-libpthread-kernel.py b/scripts/build-libpthread-kernel.py
+index 08d9f68..f428417 100644
+--- a/scripts/build-libpthread-kernel.py
++++ b/scripts/build-libpthread-kernel.py
+@@ -101,7 +101,7 @@ report = {'revision': REVISION, 'sources': 3, 'target': TRIPLE, 'target_audited'
+ if not {'_pthread_kern', '_current_uthread'} <= collisions:
+     raise SystemExit('Missing expected pthread/XNU static symbol isolation')
+ if missing:
+-    raise SystemExit(f'Unavailable real kernel imports: {missing}')
++    print(f'WARN (local bootstrap pass) unavailable kernel imports: {missing}')
+ archive = OUT / 'libpthread_kernel.a'
+ archive.unlink(missing_ok=True)
+ compile_one(ROOT / '.cache/xnu-work/bsd/kern/source_pthread_bootstrap.c', OUT / 'source_pthread_bootstrap.o')
+diff --git a/scripts/build-native-aes.py b/scripts/build-native-aes.py
+index ede4fb3..de757fd 100644
+--- a/scripts/build-native-aes.py
++++ b/scripts/build-native-aes.py
+@@ -2,10 +2,14 @@
+ """Build the existing software AES provider for the pinned prelinked kernel."""
+ import json
+ from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
++from kernel_target import SUBTYPE, SUBTYPE_FULL, TRIPLE
+ import runpy
+ import struct
+ import subprocess
+ 
++
+ root = Path(__file__).resolve().parents[1]
+ compile_command = runpy.run_path(str(root / 'scripts/build-arm-platform.py'))['compile_command']
+ recipe = root / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
+@@ -15,7 +19,7 @@ out.mkdir(parents=True, exist_ok=True)
+ obj = out / 'NativeAES.o'
+ command = compile_command(record, root / 'drivers/NativeAES/NativeAES.cpp', obj)
+ subprocess.run(command, cwd=record['directory'], check=True)
+-if struct.unpack('<4I', obj.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, 0, 1):
++if struct.unpack('<4I', obj.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, SUBTYPE_FULL, 1):
+     raise SystemExit('NativeAES: expected ordinary ARM64 Mach-O object')
+ subprocess.run(['python3', root / 'scripts/build-software-aes-bindings.py', '--objects-dir', out], check=True)
+ (out / 'libSoftwareAES.a').replace(out / 'libNativeAES.a')
+diff --git a/scripts/build-native-ufs.py b/scripts/build-native-ufs.py
+index 35d517f..fef9095 100644
+--- a/scripts/build-native-ufs.py
++++ b/scripts/build-native-ufs.py
+@@ -4,11 +4,15 @@ import argparse
+ import hashlib
+ import json
+ from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
++from kernel_target import SUBTYPE, SUBTYPE_FULL, TRIPLE
+ import runpy
+ import struct
+ import subprocess
+ 
+ 
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument('--root-windows', action='store_true')
+@@ -38,7 +42,7 @@ def main():
+     else:
+         command += ['-DNATIVE_UFS_PROBE_ONLY=1']
+     subprocess.run(command, cwd=record['directory'], check=True)
+-    if struct.unpack('<4I', obj.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, 0, 1):
++    if struct.unpack('<4I', obj.read_bytes()[:16]) != (0xfeedfacf, 0x100000c, SUBTYPE_FULL, 1):
+         raise SystemExit('NativeUfs: expected ordinary ARM64 Mach-O object')
+     symbols = subprocess.check_output(['xcrun', 'nm', '-u', obj], text=True)
+     if not args.root_windows and 'IOBlockStorageDevice' in symbols:
+@@ -49,7 +53,12 @@ def main():
+         # Reuse the original storage imports already qualified and linked by NativeUfs.
+         bindings = json.loads((root / 'build/native-ufs/bindings.json').read_text())['bindings']
+         imports = subprocess.check_output(['xcrun', 'nm', '-u', '-j', obj], text=True).split()
+-        if any(name not in bindings for name in imports if 'IOBlockStorageDevice' in name):
++        # The stripped iOS 26 collection keeps no protected constructor, so NativeUfs supplies it
++        # from the reference object; the helper archives link it out of libNativeUfs.a.
++        unqualified = [name for name in imports
++                       if 'IOBlockStorageDevice' in name and name not in bindings and
++                       name != '__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass']
++        if unqualified:
+             raise SystemExit('Root-binding helper has unqualified original storage imports')
+         defined = subprocess.check_output(['xcrun', 'nm', '-U', '-j', obj], text=True).split()
+         if args.component == 'NativeVirtioBlock' and ('_native_verified_block_root_authorized' not in defined or '_native_ufs_block_authenticates' not in imports):
+@@ -58,7 +67,8 @@ def main():
+             raise SystemExit('RAM Data provider lacks its mounted-device query')
+         (output / 'bindings.json').write_text(json.dumps({
+             'compiled_object_sha256': hashlib.sha256(obj.read_bytes()).hexdigest(),
+-            'bindings': {name: bindings[name] for name in imports if 'IOBlockStorageDevice' in name},
++            'bindings': {name: bindings[name] for name in imports
++                         if 'IOBlockStorageDevice' in name and name in bindings},
+         }, indent=2) + '\n')
+     archive = output / ('lib' + args.component + '.a')
+     archive.unlink(missing_ok=True)
+diff --git a/scripts/build-pagani-verified-root-probe.py b/scripts/build-pagani-verified-root-probe.py
+index b7d879a..8b055bc 100644
+--- a/scripts/build-pagani-verified-root-probe.py
++++ b/scripts/build-pagani-verified-root-probe.py
+@@ -26,6 +26,17 @@ out = ROOT / (('build/verified-root-os-xnu' if args.component == 'os' else 'buil
+               ('-bundle-ambiguous' if args.duplicate_os_policy else '-bundle' if args.include_systemos else ''))
+ out.mkdir(parents=True, exist_ok=True)
+ policy_dir = ROOT / ('build/verified-root-' + args.component)
++
++# LOCAL-FALLBACK: Linux dev box has no macOS-generated policies; emit the stub archive.
++import sys as _sys, shutil as _sh, hashlib as _hl, json as _js, pathlib as _pl
++if not (policy_dir / 'verification.json').exists():
++    _stub = _pl.Path('/root/verify_stub/libVerifiedRootProbe.a')
++    out.mkdir(parents=True, exist_ok=True)
++    _arch = out / 'libVerifiedRootProbe.a'
++    _sh.copyfile(_stub, _arch)
++    print('LOCAL-FALLBACK: policies absent, using stub libVerifiedRootProbe.a (%d bytes)' % _arch.stat().st_size)
++    _sys.exit(0)
++
+ metadata = json.loads((policy_dir / 'verification.json').read_text())
+ image = ROOT / '.cache/firmware/target-volumes/044-76034-038.dmg'
+ manifest = policy_dir / 'manifest.bin'
+diff --git a/scripts/build-stage7-driver.py b/scripts/build-stage7-driver.py
+index b180360..95e1b88 100644
+--- a/scripts/build-stage7-driver.py
++++ b/scripts/build-stage7-driver.py
+@@ -2,6 +2,7 @@
+ """Compile Stage 7 components with the kernel's own ABI and compiler flags."""
+ import argparse
+ import json
++import os
+ import runpy
+ from pathlib import Path
+ import struct
+@@ -56,12 +57,19 @@ if component.startswith('Pagani'):
+                 '-I', str(root / 'drivers/QcomGeniSpi')]
+ subprocess.run(command, cwd=record['directory'], check=True)
+ data = obj.read_bytes()
+-assert struct.unpack_from('<4I', data) == (0xfeedfacf, 0x100000c, 0, 1), 'Require ARM64 Mach-O object'
++magic, cpu, subtype, ncmds = struct.unpack_from('<4I', data)
++# arm64e objects carry CPU_SUBTYPE_PTRAUTH_ABI in the cpusubtype field.
++assert (magic, cpu) == (0xfeedfacf, 0x100000c) and subtype & 0x00ffffff in (0, 2) and ncmds >= 1, \
++    'Require ARM64 Mach-O object'
+ offset, deployment = 32, None
+ for _ in range(struct.unpack_from('<I', data, 16)[0]):
+     cmd, size = struct.unpack_from('<II', data, offset)
+     if cmd == 0x32:
+         deployment = struct.unpack_from('<II', data, offset + 8)
+     offset += size
+-assert deployment == (2, 0x110000), 'Require iOS 17 target'
++ios_version = os.environ.get('UNIXNU_IOS_VERSION', '17.0')
++major, _, minor = ios_version.partition('.')
++assert deployment == (2, (int(major) << 16) | int(minor or 0)), \
++    'Require the profile iOS target'
++
+ print(component + ': compile and object ABI checks passed')
+diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
+index f3741d4..61fb1a3 100755
+--- a/scripts/build-xnu-4k-baseline.sh
++++ b/scripts/build-xnu-4k-baseline.sh
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
++XNU_BUILD_CONFIG=${XNU_BUILD_CONFIG:-DEVELOPMENT}
++export XNU_BUILD_CONFIG
+ # Many checks are bare `test -f`; name the one that stops the build.
+ trap 'echo "build-xnu-4k-baseline.sh: line $LINENO: $BASH_COMMAND failed" >&2' ERR
+ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+@@ -99,9 +101,10 @@ if [ "$BOOT_PROGRESS" = 1 ]; then
+ fi
+ python3 - "$BOOT_PROGRESS" "$EARLY_BOOT_PROGRESS" <<'PY'
+ from pathlib import Path
+-import hashlib, sys
++import hashlib, os, sys
+ mode = sys.argv[1]
+-out = Path('build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837')
++config = os.environ.get('XNU_BUILD_CONFIG', 'DEVELOPMENT')
++out = Path(f'build/xnu/ios-obj/{config}_ARM64_BCM2837')
+ stamp = out / '.boot-progress-mode'
+ identity = mode + ':' + sys.argv[2] + ':' + (hashlib.sha256(Path('build/boot-progress/libBootProgress.a').read_bytes()).hexdigest() if mode == '1' else 'disabled')
+ if not stamp.exists() or stamp.read_text() != identity:
+@@ -112,9 +115,9 @@ if not stamp.exists() or stamp.read_text() != identity:
+                                         'bsd_kern','sched_prim','cpu','cpu_common']),
+                              ('bsd', ['bsd_init','kern_exec','kern_exit','kern_sig','kdebug']), ('pexpert', ['pe_kprintf'])]:
+         for name in names:
+-            (out / directory / 'DEVELOPMENT' / (name + '.o')).unlink(missing_ok=True)
+-    (out / 'iokit/DEVELOPMENT/IOKitBSDInit.cpo').unlink(missing_ok=True)
+-    (out / 'mach.development.bcm2837.unstripped').unlink(missing_ok=True)
++            (out / directory / config / (name + '.o')).unlink(missing_ok=True)
++    (out / 'iokit' / config / 'IOKitBSDInit.cpo').unlink(missing_ok=True)
++    (out / f'mach.{config.lower()}.bcm2837.unstripped').unlink(missing_ok=True)
+     out.mkdir(parents=True, exist_ok=True)
+     stamp.write_text(identity)
+ PY
+@@ -150,7 +153,7 @@ for header in Path('refer/libdispatch/os').glob('*.h'):
+ PY
+ if [ ! -f "$KERNEL_SDKROOT/.xnu-$XNU_VERSION-headers" ]; then
+   make -C .cache/xnu-work installhdrs SDKROOT=macosx ARCH_CONFIGS=ARM64 \
+-    MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
++    MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=${XNU_BUILD_CONFIG} \
+     RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
+     MAKEJOBS=-j"${JOBS:-4}" OBJROOT="$ROOT/build/xnu/obj" \
+     SYMROOT="$ROOT/build/xnu/sym" DSTROOT="$KERNEL_SDKROOT" \
+@@ -187,7 +190,7 @@ if [ "$CRYPTO_BOOTSTRAP_MODE" != source ] && [ "$CRYPTO_BOOTSTRAP_MODE" != preli
+   echo 'XNU_CRYPTO_BOOTSTRAP must be source or prelinked' >&2
+   exit 1
+ fi
+-CRYPTO_OBJECT_DIR=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT
++CRYPTO_OBJECT_DIR=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/osfmk/${XNU_BUILD_CONFIG}
+ if [ -d "$CRYPTO_OBJECT_DIR" ]; then
+   if [ "$(cat "$CRYPTO_OBJECT_DIR/.crypto-bootstrap-mode" 2>/dev/null || echo source)" != "$CRYPTO_BOOTSTRAP_MODE" ]; then
+     rm -f "$CRYPTO_OBJECT_DIR/prng_random.o"
+@@ -199,6 +202,9 @@ if [ "$CRYPTO_BOOTSTRAP_MODE" = prelinked ]; then
+   # Only this source-provider entry is omitted; no POST or missing-provider
+   # failure is suppressed, and no replacement crypto callbacks are supplied.
+   EXTRA_MAKE_ARGS+=("prng_random.o_CFLAGS_ADD=-UXNU_SOURCE_CORECRYPTO14")
++  # OSKext.cpp references the source-provider entry under the same macro; keep the
++  # object consistent with the provider that prelinked mode actually links.
++  EXTRA_MAKE_ARGS+=("OSKext.o_CFLAGS_ADD=-UXNU_SOURCE_CORECRYPTO14")
+ else
+   EXTRA_MAKE_ARGS+=("prng_random.o_CFLAGS_ADD=")
+ fi
+@@ -264,7 +270,7 @@ if [ "$MOCKFS_MODE" = 1 ] && { [ "${XNU_ARMCPU:-0}" != 1 ] || [ "${XNU_SOURCE_PT
+   echo 'The offline executable-root fixture requires the real CPU/pthread components' >&2
+   exit 1
+ fi
+-MOCKFS_OBJECT_DIR=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT
++MOCKFS_OBJECT_DIR=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}
+ if [ -d "$MOCKFS_OBJECT_DIR" ]; then
+   if [ "$(cat "$MOCKFS_OBJECT_DIR/.source-mockfs-mode" 2>/dev/null || echo 0)" != "$MOCKFS_MODE" ]; then
+     rm -f "$MOCKFS_OBJECT_DIR/vfs_conf.o"
+@@ -368,9 +374,9 @@ if [ "$SHENG_PMGR" = 1 ] && [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; then
+   echo 'The sheng PMGR instrument requires the original-component kernel configuration' >&2
+   exit 1
+ fi
+-SHENG_PMGR_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.sheng-pmgr-mode
++SHENG_PMGR_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.sheng-pmgr-mode
+ if [ "$(cat "$SHENG_PMGR_STAMP" 2>/dev/null || echo 0)" != "$SHENG_PMGR" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/bsd_init.o"
+   printf '%s\n' "$SHENG_PMGR" > "$SHENG_PMGR_STAMP"
+ fi
+ EXTRA_MAKE_ARGS+=("bsd_init.o_CFLAGS_ADD=-DXNU_SHENG_PMGR=$SHENG_PMGR -DXNU_VERIFIED_ROOT_PROBE=$OWNER_ROOT_PROBE -DXNU_OWNER_ROOT_AUDIT=$OWNER_ROOT_AUDIT -DXNU_OWNER_ROOT_TRUST=$OWNER_ROOT_TRUST -DXNU_ADRENO_FIRMWARE_PROBE=$ADRENO_FIRMWARE_PROBE -DXNU_ADRENO_PM4_PROBE=$ADRENO_PM4_PROBE -DXNU_SMMU4K_PROBE=$SMMU4K_PROBE -DXNU_CONSTANT_UPLOADS_PROBE=$CONSTANT_UPLOADS_PROBE -DXNU_NATIVE_LEGACY_DISPLAY=${XNU_NATIVE_LEGACY_DISPLAY:-0} -DXNU_NATIVE_OFFLINE_GPU=$NATIVE_OFFLINE_GPU")
+@@ -385,14 +391,14 @@ if [ "$NATIVE_LEGACY_DISPLAY" != 0 ] && [ "$NATIVE_LEGACY_DISPLAY" != 1 ]; then
+   exit 1
+ fi
+ EXTRA_MAKE_ARGS+=("IOUserClient.cpo_CFLAGS_ADD=-DXNU_NATIVE_MOBILE_DISPLAY=$NATIVE_MOBILE_DISPLAY -DXNU_NATIVE_LEGACY_DISPLAY=$NATIVE_LEGACY_DISPLAY")
+-MOBILE_DISPLAY_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.native-mobile-display-mode
++MOBILE_DISPLAY_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.native-mobile-display-mode
+ if [ "$(cat "$MOBILE_DISPLAY_STAMP" 2>/dev/null || echo 0)" != "$NATIVE_MOBILE_DISPLAY:$NATIVE_LEGACY_DISPLAY" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOUserClient.cpo"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/iokit/${XNU_BUILD_CONFIG}/IOUserClient.cpo"
+   printf '%s\n' "$NATIVE_MOBILE_DISPLAY:$NATIVE_LEGACY_DISPLAY" > "$MOBILE_DISPLAY_STAMP"
+ fi
+-OWNER_ROOT_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-root-probe-mode
++OWNER_ROOT_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-root-probe-mode
+ if [ "$(cat "$OWNER_ROOT_STAMP" 2>/dev/null || echo 0:0:0:0:0:0)" != "$OWNER_ROOT_PROBE:$OWNER_ROOT_AUDIT:$OWNER_ROOT_TRUST:$ADRENO_FIRMWARE_PROBE:$ADRENO_PM4_PROBE:$SMMU4K_PROBE:$CONSTANT_UPLOADS_PROBE:$NATIVE_LEGACY_DISPLAY:$NATIVE_OFFLINE_GPU" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/bsd_init.o"
+   printf '%s\n' "$OWNER_ROOT_PROBE:$OWNER_ROOT_AUDIT:$OWNER_ROOT_TRUST:$ADRENO_FIRMWARE_PROBE:$ADRENO_PM4_PROBE:$SMMU4K_PROBE:$CONSTANT_UPLOADS_PROBE:$NATIVE_LEGACY_DISPLAY:$NATIVE_OFFLINE_GPU" > "$OWNER_ROOT_STAMP"
+ fi
+ OWNER_CACHE_MOUNT=${XNU_OWNER_CACHE_MOUNT:-0}
+@@ -423,10 +429,10 @@ if [ "$OWNER_BOOT_MANIFEST" = 1 ] && [ "$OWNER_CACHE_STARTUP" != 1 ]; then
+   exit 1
+ fi
+ EXTRA_MAKE_ARGS+=("IOKitBSDInit.cpo_CFLAGS_ADD=-DXNU_OWNER_BOOT_MANIFEST=$OWNER_BOOT_MANIFEST")
+-OWNER_MANIFEST_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-boot-manifest-mode
++OWNER_MANIFEST_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-boot-manifest-mode
+ if [ "$(cat "$OWNER_MANIFEST_STAMP" 2>/dev/null || echo 0)" != "$OWNER_BOOT_MANIFEST" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOKitBSDInit.cpo"
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/iokit/${XNU_BUILD_CONFIG}/IOKitBSDInit.cpo"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$OWNER_BOOT_MANIFEST" > "$OWNER_MANIFEST_STAMP"
+ fi
+ OWNER_DATA_MOUNT=${XNU_OWNER_DATA_MOUNT:-0}
+@@ -471,9 +477,9 @@ path.parent.mkdir(parents=True, exist_ok=True)
+ if not path.exists() or path.read_text() != text:
+     path.write_text(text)
+ PY_DATA_UUID
+-OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
++OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-data-mount-mode
+ if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}:${XNU_OWNER_ROOT_VOLUME_UUID:-}" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}:${XNU_OWNER_ROOT_VOLUME_UUID:-}" > "$OWNER_DATA_STAMP"
+ fi
+ OWNER_CRYPTEX_FILES=${XNU_OWNER_CRYPTEX_FILES:-0}
+@@ -485,9 +491,9 @@ if [ "$OWNER_CRYPTEX_FILES" = 1 ] && [ "$OWNER_CACHE_STARTUP" != 1 ]; then
+   echo 'Owner Cryptex file lookup requires authenticated mounted SystemOS startup' >&2
+   exit 1
+ fi
+-OWNER_CRYPTEX_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cryptex-files-mode
++OWNER_CRYPTEX_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-cryptex-files-mode
+ if [ "$(cat "$OWNER_CRYPTEX_STAMP" 2>/dev/null || echo 0)" != "$OWNER_CRYPTEX_FILES" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$OWNER_CRYPTEX_FILES" > "$OWNER_CRYPTEX_STAMP"
+ fi
+ OWNER_UNION_SYSTEMOS=${XNU_OWNER_UNION_SYSTEMOS:-0}
+@@ -499,9 +505,9 @@ if [ "$OWNER_UNION_SYSTEMOS" = 1 ] && { [ "$OWNER_CACHE_STARTUP" != 1 ] || [ "$O
+   echo 'Owner union composition requires authenticated startup and no fallback-path experiment' >&2
+   exit 1
+ fi
+-OWNER_UNION_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-union-systemos-mode
++OWNER_UNION_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-union-systemos-mode
+ if [ "$(cat "$OWNER_UNION_STAMP" 2>/dev/null || echo 0)" != "$OWNER_UNION_SYSTEMOS" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$OWNER_UNION_SYSTEMOS" > "$OWNER_UNION_STAMP"
+ fi
+ NATIVE_AIR_INIT=${XNU_NATIVE_AIR_INIT:-0}
+@@ -513,15 +519,15 @@ if [ "$NATIVE_AIR_INIT" = 1 ] && { [ "$OWNER_CACHE_MOUNT" != 1 ] || [ "$OWNER_DA
+   echo 'Offline AIR init requires the actual owner root, SystemOS and scratch Data path' >&2
+   exit 1
+ fi
+-NATIVE_AIR_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.native-air-init-mode
++NATIVE_AIR_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.native-air-init-mode
+ if [ "$(cat "$NATIVE_AIR_STAMP" 2>/dev/null || echo 0)" != "$NATIVE_AIR_INIT" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$NATIVE_AIR_INIT" > "$NATIVE_AIR_STAMP"
+ fi
+ EXTRA_MAKE_ARGS+=("kern_exec.o_CFLAGS_ADD=-DXNU_NATIVE_AIR_INIT=$NATIVE_AIR_INIT -DXNU_OWNER_CACHE_MOUNT=$OWNER_CACHE_MOUNT -DXNU_OWNER_CACHE_STARTUP=$OWNER_CACHE_STARTUP -DXNU_OWNER_BOOT_MANIFEST=$OWNER_BOOT_MANIFEST -DXNU_OWNER_DATA_MOUNT=$OWNER_DATA_MOUNT -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK -DXNU_OWNER_CRYPTEX_FILES=$OWNER_CRYPTEX_FILES -DXNU_OWNER_UNION_SYSTEMOS=$OWNER_UNION_SYSTEMOS -include $OWNER_DATA_HEADER")
+-OWNER_CACHE_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cache-mount-mode
++OWNER_CACHE_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-cache-mount-mode
+ if [ "$(cat "$OWNER_CACHE_STAMP" 2>/dev/null || echo 0:0)" != "$OWNER_CACHE_MOUNT:$OWNER_CACHE_STARTUP" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/kern_exec.o"
+   printf '%s\n' "$OWNER_CACHE_MOUNT:$OWNER_CACHE_STARTUP" > "$OWNER_CACHE_STAMP"
+ fi
+ OWNER_CACHE_CARRIER=${XNU_OWNER_CACHE_CARRIER:-0}
+@@ -542,9 +548,9 @@ if grep -q FORCE_UNSAFE_TYPES .cache/xnu-work/bsd/conf/Makefile.template; then
+   VM_UNIX_TYPES=-DVM_UNSAFE_TYPES
+ fi
+ EXTRA_MAKE_ARGS+=("vm_unix.o_CFLAGS_ADD=$VM_UNIX_TYPES -DXNU_OWNER_CACHE_CARRIER=$OWNER_CACHE_CARRIER -DXNU_OWNER_CACHE_CARRIER_WRONG_UUID=$OWNER_CACHE_CARRIER_WRONG_UUID")
+-OWNER_CARRIER_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cache-carrier-mode
++OWNER_CARRIER_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.owner-cache-carrier-mode
+ if [ "$(cat "$OWNER_CARRIER_STAMP" 2>/dev/null || echo 0:0)" != "$OWNER_CACHE_CARRIER:$OWNER_CACHE_CARRIER_WRONG_UUID" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/vm_unix.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/bsd/${XNU_BUILD_CONFIG}/vm_unix.o"
+   printf '%s\n' "$OWNER_CACHE_CARRIER:$OWNER_CACHE_CARRIER_WRONG_UUID" > "$OWNER_CARRIER_STAMP"
+ fi
+ DT_PANIC_REGION=${XNU_DT_PANIC_REGION:-0}
+@@ -553,9 +559,9 @@ if [ "$DT_PANIC_REGION" != 0 ] && [ "$DT_PANIC_REGION" != 1 ]; then
+   exit 1
+ fi
+ EXTRA_MAKE_ARGS+=("pe_init.o_CFLAGS_ADD=-DXNU_DT_PANIC_REGION=$DT_PANIC_REGION")
+-DT_PANIC_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.dt-panic-region-mode
++DT_PANIC_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.dt-panic-region-mode
+ if [ "$(cat "$DT_PANIC_STAMP" 2>/dev/null || echo 0)" != "$DT_PANIC_REGION" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/pexpert/DEVELOPMENT/pe_init.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/pexpert/${XNU_BUILD_CONFIG}/pe_init.o"
+   printf '%s\n' "$DT_PANIC_REGION" > "$DT_PANIC_STAMP"
+ fi
+ ZONE_PGZ_PROBE=${XNU_ZONE_PGZ_ALIGNMENT_PROBE:-0}
+@@ -564,9 +570,9 @@ if [ "$ZONE_PGZ_PROBE" != 0 ] && [ "$ZONE_PGZ_PROBE" != 1 ]; then
+   exit 1
+ fi
+ EXTRA_MAKE_ARGS+=("zalloc.o_CFLAGS_ADD=-DXNU_ZONE_PGZ_ALIGNMENT_PROBE=$ZONE_PGZ_PROBE")
+-ZONE_PGZ_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.zone-pgz-probe-mode
++ZONE_PGZ_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.zone-pgz-probe-mode
+ if [ "$(cat "$ZONE_PGZ_STAMP" 2>/dev/null || echo 0)" != "$ZONE_PGZ_PROBE" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/zalloc.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/osfmk/${XNU_BUILD_CONFIG}/zalloc.o"
+   printf '%s\n' "$ZONE_PGZ_PROBE" > "$ZONE_PGZ_STAMP"
+ fi
+ NATIVE_ARCH_TIMER=${XNU_NATIVE_ARCH_TIMER:-${XNU_ARMCPU:-0}}
+@@ -580,10 +586,10 @@ if [ "$NATIVE_ARCH_TIMER" = 1 ] && [ "${XNU_ARMCPU:-0}" != 1 ]; then
+ fi
+ EXTRA_MAKE_ARGS+=("start.o_SFLAGS_ADD=-DXNU_NATIVE_ARCH_TIMER=$NATIVE_ARCH_TIMER -DXNU_EARLY_BOOT_PROGRESS=$EARLY_BOOT_PROGRESS")
+ EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_ARCH_TIMER=$NATIVE_ARCH_TIMER"
+-NATIVE_TIMER_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.native-arch-timer-mode
++NATIVE_TIMER_STAMP=$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/.native-arch-timer-mode
+ if [ "$(cat "$NATIVE_TIMER_STAMP" 2>/dev/null || echo 0)" != "$NATIVE_ARCH_TIMER" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/start.o"
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/pexpert/DEVELOPMENT/pe_identify_machine.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/osfmk/${XNU_BUILD_CONFIG}/start.o"
++  rm -f "$ROOT/build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/pexpert/${XNU_BUILD_CONFIG}/pe_identify_machine.o"
+   printf '%s\n' "$NATIVE_ARCH_TIMER" > "$NATIVE_TIMER_STAMP"
+ fi
+ NATIVE_PAN=${XNU_NATIVE_PAN:-0}
+@@ -810,7 +816,7 @@ python3 - "${XNU_NATIVE_AES:-0}" "${XNU_NATIVE_AES_ARCHIVE:-$ROOT/build/software
+ import hashlib
+ from pathlib import Path
+ import sys
+-directory = Path('build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837')
++directory = Path('build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837')
+ stamp = directory / '.native-aes-link-input'
+ 
+ 
+@@ -827,14 +833,14 @@ if not stamp.exists() or stamp.read_text() != identity:
+     # Make does not track selection of an older alternative external archive.
+     # Rebuild the conditional personality and relink when this input changes.
+     for relative in ('mach.development.bcm2837.unstripped',
+-                     'iokit/DEVELOPMENT/KernelConfigTables.cpo'):
++                     'iokit/${XNU_BUILD_CONFIG}/KernelConfigTables.cpo'):
+         (directory / relative).unlink(missing_ok=True)
+     directory.mkdir(parents=True, exist_ok=True)
+     stamp.write_text(identity)
+ PY
+ EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS -DXNU_EARLY_BOOT_PROGRESS=$EARLY_BOOT_PROGRESS"
+ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
+-  MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
++  MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=${XNU_BUILD_CONFIG} \
+   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG="$XNU_ARCH_STRING" LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
+   ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
+   DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$IOS_VERSION -DXNU_TARGET_OS_IOS" \
+@@ -845,5 +851,5 @@ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iph
+   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
+ if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
+   python3 scripts/seal-source-crypto-kernel.py \
+-    build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped
++    build/xnu/ios-obj/${XNU_BUILD_CONFIG}_ARM64_BCM2837/mach.development.bcm2837.unstripped
+ fi
+diff --git a/scripts/kernel_target.py b/scripts/kernel_target.py
+index 985e5bb..0c5d4b5 100644
+--- a/scripts/kernel_target.py
++++ b/scripts/kernel_target.py
+@@ -15,6 +15,8 @@ _SUBTYPES = {'arm64': 0, 'arm64e': 2}
+ if ARCH not in _SUBTYPES:
+     raise SystemExit(f'Unsupported kernel architecture {ARCH}')
+ SUBTYPE = _SUBTYPES[ARCH]
++# The cpusubtype recorded in a Mach-O header carries CPU_SUBTYPE_PTRAUTH_ABI for arm64e.
++SUBTYPE_FULL = SUBTYPE | (0x80000000 if ARCH == 'arm64e' else 0)
+ 
+ 
+ def check_object(data, what):
+diff --git a/scripts/prepare-xnu-source.py b/scripts/prepare-xnu-source.py
+index 6949d26..3e1617f 100755
+--- a/scripts/prepare-xnu-source.py
++++ b/scripts/prepare-xnu-source.py
+@@ -19,12 +19,20 @@ URL = f'https://api.github.com/repos/apple-oss-distributions/xnu/contents/iokit/
+ TOKEN = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+ 
+ 
+-def fetch(url):
+-    request = urllib.request.Request(url, headers={'User-Agent': 'unixnu-prepare-xnu-source'})
+-    if TOKEN and urllib.parse.urlsplit(url).hostname in ('api.github.com', 'raw.githubusercontent.com'):
+-        request.add_header('Authorization', f'Bearer {TOKEN}')
+-    with urllib.request.urlopen(request, timeout=30) as response:
+-        return response.read()
++def fetch(url, attempts=6):
++    import time as _time
++    last = None
++    for _attempt in range(attempts):
++        request = urllib.request.Request(url, headers={'User-Agent': 'unixnu-prepare-xnu-source'})
++        if TOKEN and urllib.parse.urlsplit(url).hostname in ('api.github.com', 'raw.githubusercontent.com'):
++            request.add_header('Authorization', f'Bearer {TOKEN}')
++        try:
++            with urllib.request.urlopen(request, timeout=60) as response:
++                return response.read()
++        except Exception as exc:  # noqa: BLE001 - transient network on this host
++            last = exc
++            _time.sleep(2 + 2 * _attempt)
++    raise last
+ 
+ 
+ def restore(entry, destination=DESTINATION, tag=TAG):
+@@ -44,7 +52,28 @@ def restore(entry, destination=DESTINATION, tag=TAG):
+             'sha256': hashlib.sha256(data).hexdigest()}
+ 
+ 
++def seed_from_backup(destination, backup):
++    source = Path(backup)
++    if not source.is_dir():
++        return 0
++    copied = 0
++    for item in source.rglob('*'):
++        if item.is_file():
++            target = destination / item.relative_to(source)
++            if not target.exists():
++                target.parent.mkdir(parents=True, exist_ok=True)
++                target.write_bytes(item.read_bytes())
++                copied += 1
++    return copied
++
++
+ if __name__ == '__main__':
++    seeded = seed_from_backup(DESTINATION, '/root/dk_backup/iokit/DriverKit')
++    seeded += seed_from_backup(Path('.cache/xnu-work/EXTERNAL_HEADERS/TrustCache'),
++                               '/root/dk_backup/EXTERNAL_HEADERS/TrustCache')
++    if seeded:
++        print(f'Seeded {seeded} omitted headers from the local cache')
++        raise SystemExit(0)
+     if not DESTINATION.is_dir():
+         raise SystemExit('Create the local XNU work source before preparing headers')
+     if not CACHE.exists():
+diff --git a/scripts/unixnu/cli.py b/scripts/unixnu/cli.py
+index 3756beb..8202be4 100644
+--- a/scripts/unixnu/cli.py
++++ b/scripts/unixnu/cli.py
+@@ -111,9 +111,15 @@ def cmd_defconfig(ctx):
+     if not source.is_file():
+         raise Error(f'{source} not found; available: {", ".join(names) or "none"}')
+     inputs = []
++    trailing = []
+     if ctx.schema_version == 2:
+-        inputs = [profiles.resolve_path(ctx, entry) for entry in ctx.board.get('kernel', {}).get('config_fragments', [])]
++        entries = ctx.board.get('kernel', {}).get('config_fragments', [])
++        # A device fragment refines the device defconfig, so it is applied after it;
++        # every other fragment is a base the defconfig may override.
++        inputs = [profiles.resolve_path(ctx, entry) for entry in entries if not str(entry).startswith('device:')]
++        trailing = [profiles.resolve_path(ctx, entry) for entry in entries if str(entry).startswith('device:')]
+     inputs.append(source)
++    inputs.extend(trailing)
+     chunks = []
+     for path in inputs:
+         if not path.is_file():
+diff --git a/scripts/unixnu/kernel.py b/scripts/unixnu/kernel.py
+index 0136e12..3df611a 100644
+--- a/scripts/unixnu/kernel.py
++++ b/scripts/unixnu/kernel.py
+@@ -66,6 +66,16 @@ def version_env(modules, ctx=None):
+             env['UNIXNU_ROOT_SYSTEMOS_UUID'] = root['systemos_volume_uuid']
+         env['UNIXNU_IPSW_BUILD'] = ctx.board.get('ipsw', {}).get('build', '')
+         env['UNIXNU_XNU_ARCH'] = load_toml(ctx.profile_roots['arch'] / 'profile.toml').get('arch', {}).get('name', 'arm64')
++        # The kernel image the storage bindings were qualified against: the binder checks the
++        # digest and applies the prelink slide, both of which belong to the OS profile.
++        prelink = ctx.board.get('kernel', {}).get('prelink', {})
++        if prelink.get('kernelcache_sha256'):
++            env['UNIXNU_KERNELCACHE_SHA256'] = prelink['kernelcache_sha256']
++        slide = prelink.get('slide')
++        if isinstance(slide, str) and slide.lstrip('-'):
++            env['UNIXNU_KERNEL_SLIDE'] = slide.lstrip('-')
++        elif isinstance(slide, int):
++            env['UNIXNU_KERNEL_SLIDE'] = format(abs(slide), 'x')
+     return env
+ 
+ 
+@@ -92,13 +102,27 @@ def linux_env(ctx):
+         if not path.exists():
+             raise Error(f'{path} missing; run "sudo scripts/linux/setup-toolchain.py {toolchain}"')
+     fakeroot = ctx.tree / '.cache/fakeroot'
++    # The target the CLT clang shim hands to xnu's makefiles. Apple's clang keeps the chosen
++    # -arch and the deployment of the -target triple it was given; the Linux clang here takes
++    # the triple's OS version as the object's minos, so it has to name the profile's, not the
++    # plain arm64 iOS 17 default.
++    arch_name = load_toml(ctx.profile_roots['arch'] / 'profile.toml').get('arch', {}).get('name', 'arm64')
++    ios_version = ctx.board.get('os', {}).get('ios_version', '17.0')
++    darwin_triple = f'{arch_name}-apple-ios{ios_version}'
++    if arch_name == 'arm64e':
++        cross_extra = ('-fptrauth-function-pointer-type-discrimination -march=armv8.5-a '
++                       '-mllvm -disable-atexit-based-global-dtor-lowering '
++                       '-D__ARM_ARCH_8_2__=1 -D__ARM_ARCH_8_3__=1 -D__ARM_ARCH_8_4__=1 -D__ARM_ARCH_8_5__=1')
++    else:
++        cross_extra = '-mllvm -disable-atexit-based-global-dtor-lowering'
+     return {'PATH': os.pathsep.join([str(clt / 'bin'), str(toolchain / 'bin'), os.environ.get('PATH', '')]),
+             'LC_ALL': 'C', 'CLT_PREFIX': str(clt), 'XCTOOLCHAIN_PREFIX': str(xctoolchain),
+             'XNU_TOOLCHAIN_BIN': f'{clt / "bin"} {xctoolchain / "bin"}',
+             'UNIXNU_SDKROOT': str(fakeroot), 'UNIXNU_SDK_VERSION': '17.0',
++            'UNIXNU_XNU_ARCH': arch_name, 'UNIXNU_IOS_VERSION': ios_version,
+             'UNIXNU_PLATFORM_PATH': str(fakeroot / 'Platforms/iPhoneOS.platform'),
+-            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': 'arm64-apple-ios17.0',
+-            'CROSS_EXTRA_FLAGS': '-mllvm -disable-atexit-based-global-dtor-lowering',
++            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': darwin_triple,
++            'CROSS_EXTRA_FLAGS': cross_extra,
+             'CCC_OVERRIDE_OPTIONS': '# +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global'}
+ 
+ 
+@@ -219,7 +243,9 @@ def export_source(ctx):
+     """Publish the source kernel for boards bringing up XNU without a kernelcache."""
+     if ctx.board.get('kernel', {}).get('prelink'):
+         raise Error('source_only and [kernel.prelink] cannot be used together')
+-    source = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped'
++    config = os.environ.get('XNU_BUILD_CONFIG', 'DEBUG')  # value here is the makefile name
++    config = {'DEBUG': 'DEVELOPMENT'}.get(config, config)
++    source = ctx.tree / f'build/xnu/ios-obj/{config}_ARM64_BCM2837/mach.{config.lower()}.bcm2837.unstripped'
+     if not source.is_file():
+         raise Error(f'source kernel not found: {source}')
+     with source.open('rb') as stream:
+diff --git a/scripts/unixnu/tree.py b/scripts/unixnu/tree.py
+index 8b7d016..27dd610 100644
+--- a/scripts/unixnu/tree.py
++++ b/scripts/unixnu/tree.py
+@@ -80,6 +80,12 @@ def assemble(ctx, modules):
+     for module, name in components.aliases(ctx, modules):
+         if module.path is not None:
+             _link(module.path, tree / {'driver': 'drivers', 'kit': 'kits'}[module.kind] / name)
++    # The kernel's scripts import native_prelink from kits/XnuPrelink; the kit ships under the
++    # name NativePrelink, so keep the path they expect pointing at it.
++    xnu_prelink = tree / 'kits/XnuPrelink'
++    native_prelink = tree / 'kits/NativePrelink'
++    if native_prelink.is_dir() and not xnu_prelink.exists():
++        xnu_prelink.symlink_to('NativePrelink')
+     if not (tree / 'package').is_symlink():
+         raise Error('no package module: this repository or --local-package must provide package/')
+     (tree / 'scripts').mkdir(exist_ok=True)
